@@ -1,0 +1,26 @@
+# Non-secret configuration for nvd-claude-proxy.
+# Copy to config.yaml and keep secrets in the environment where possible.
+
+server:
+  host: 127.0.0.1
+  port: 8787
+  log_level: info
+  # api_key: optional-client-facing-proxy-key
+
+nvidia:
+  base_url: https://integrate.api.nvidia.com/v1
+  # Prefer NVIDIA_API_KEY env var instead of storing the key here.
+  # api_key: nvapi-...
+  default_model: nvidia/llama-3.3-nemotron-super-49b-v1.5
+
+streaming:
+  ping_interval: 15.0
+  text_delta_chars: 6
+
+model_aliases:
+  claude-3-5-sonnet-20241022: nvidia/llama-3.3-nemotron-super-49b-v1.5
+  claude-3-7-sonnet-20250219: nvidia/llama-3.3-nemotron-super-49b-v1.5
+  claude-sonnet-4-20250514: nvidia/llama-3.3-nemotron-super-49b-v1.5
+  claude-sonnet-4-5: nvidia/llama-3.3-nemotron-super-49b-v1.5
+  claude-haiku-4-5: nvidia/nvidia-nemotron-nano-9b-v2
+  claude-opus-4-1: nvidia/llama-3.1-nemotron-ultra-253b-v1

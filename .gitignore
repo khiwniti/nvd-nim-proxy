@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local secrets/config
+.env
+.env.*
+!.env.example
+config.yaml
+
+# OS/editor noise
+.DS_Store
+.idea/
+.vscode/
+
+# Claude Code local runtime artifacts that can contain credentials/session data
+.claude/settings.local.json
+.claude/.credentials.json
+.claude/logs/
+.claude/shell-snapshots/
+.claude/tasks/
+.claude/backups/
