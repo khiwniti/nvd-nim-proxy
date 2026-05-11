@@ -104,6 +104,8 @@
 - [x] T028 Add route-level smoke tests for /healthz and /v1/messages validation in tests/test_routes.py (FR-007, FR-001 coverage)
 - [x] T029 Add tests/conftest.py to stub NVIDIA_API_KEY so route tests run offline
 - [x] T030 Document env-overrides-YAML precedence in research.md (resolves U2)
+- [x] T031 Add eager message_start streaming test in tests/test_stream_eager.py (resolves C3, SC-002)
+- [x] T032 Pin pytest-asyncio in requirements.txt
 
 ## Dependencies & Execution Order
 
