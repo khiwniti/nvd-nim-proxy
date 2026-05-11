@@ -38,34 +38,92 @@ import json
 import os
 import re
 import secrets
+from pathlib import Path
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
 import httpx
 import orjson
 import uvicorn
+import yaml
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
 
 # ─── Config ──────────────────────────────────────────────────────────────────
 
-NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY")
-NVIDIA_BASE_URL = os.environ.get(
-    "NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1"
+DEFAULT_NVIDIA_MODEL = "nvidia/llama-3.3-nemotron-super-49b-v1.5"
+DEFAULT_MODEL_ALIASES = {
+    # Common Claude Code model names and families. Users can override or extend
+    # these in config.yaml under model_aliases or with MODEL_ALIAS_* env vars.
+    "claude-3-5-sonnet-20241022": DEFAULT_NVIDIA_MODEL,
+    "claude-3-7-sonnet-20250219": DEFAULT_NVIDIA_MODEL,
+    "claude-sonnet-4-20250514": DEFAULT_NVIDIA_MODEL,
+    "claude-sonnet-4-5": DEFAULT_NVIDIA_MODEL,
+    "claude-haiku-4-5": DEFAULT_NVIDIA_MODEL,
+    "claude-opus-4-1": DEFAULT_NVIDIA_MODEL,
+}
+
+def _load_yaml_config() -> dict:
+    """Load non-secret config from YAML. Env vars remain authoritative.
+
+    Set PROXY_CONFIG=/path/to/config.yaml to choose a file. If unset, a local
+    config.yaml is used when present; otherwise defaults are used.
+    """
+    cfg_path = os.environ.get("PROXY_CONFIG")
+    path = Path(cfg_path) if cfg_path else Path("config.yaml")
+    if not path.exists():
+        return {}
+    with path.open("r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    if not isinstance(data, dict):
+        raise RuntimeError(f"config file must contain a YAML mapping: {path}")
+    return data
+
+_CONFIG = _load_yaml_config()
+_SERVER = _CONFIG.get("server") or {}
+_NVIDIA = _CONFIG.get("nvidia") or {}
+_STREAMING = _CONFIG.get("streaming") or {}
+
+NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY") or _NVIDIA.get("api_key")
+NVIDIA_BASE_URL = os.environ.get("NVIDIA_BASE_URL") or _NVIDIA.get(
+    "base_url", "https://integrate.api.nvidia.com/v1"
 )
-PROXY_HOST = os.environ.get("PROXY_HOST", "127.0.0.1")
-PROXY_PORT = int(os.environ.get("PROXY_PORT", "8787"))
-PROXY_API_KEY = os.environ.get("PROXY_API_KEY") or None
-LOG_LEVEL = os.environ.get("LOG_LEVEL", "info")
+PROXY_HOST = os.environ.get("PROXY_HOST") or _SERVER.get("host", "127.0.0.1")
+PROXY_PORT = int(os.environ.get("PROXY_PORT") or _SERVER.get("port", 8787))
+PROXY_API_KEY = os.environ.get("PROXY_API_KEY") or _SERVER.get("api_key") or None
+LOG_LEVEL = os.environ.get("LOG_LEVEL") or _SERVER.get("log_level", "info")
+DEFAULT_MODEL = os.environ.get("DEFAULT_NVIDIA_MODEL") or _NVIDIA.get(
+    "default_model", DEFAULT_NVIDIA_MODEL
+)
+
+MODEL_ALIASES = {**DEFAULT_MODEL_ALIASES}
+MODEL_ALIASES.update(_CONFIG.get("model_aliases") or {})
+for k, v in os.environ.items():
+    if k.startswith("MODEL_ALIAS_") and v:
+        alias = k.removeprefix("MODEL_ALIAS_").lower().replace("__", "/").replace("_", "-")
+        MODEL_ALIASES[alias] = v
+for alias in list(MODEL_ALIASES):
+    if MODEL_ALIASES[alias] == DEFAULT_NVIDIA_MODEL:
+        MODEL_ALIASES[alias] = DEFAULT_MODEL
 
 # 15 s matches Anthropic's official cadence; keeps Claude Code's TUI alive
 # during long reasoning phases (Nemotron Ultra can think for 30+ seconds).
-PING_INTERVAL = 15.0
+PING_INTERVAL = float(_STREAMING.get("ping_interval", 15.0))
 
 # Anthropic streams at ~sub-word granularity. NVIDIA emits 10–40-char chunks.
 # We resplit on word/punctuation boundaries to recreate the "typing" feel.
-TEXT_DELTA_CHARS = 6
+TEXT_DELTA_CHARS = int(_STREAMING.get("text_delta_chars", 6))
+
+def resolve_model(requested: str) -> str:
+    """Resolve a Claude Code requested model to an upstream NVIDIA model."""
+    if requested in MODEL_ALIASES:
+        return MODEL_ALIASES[requested]
+    # Family-prefix fallback catches dated Claude Code aliases while preserving
+    # native NVIDIA model IDs that users pass through directly.
+    if requested.startswith(("claude-", "anthropic/claude-")):
+        return DEFAULT_MODEL
+    return requested
 
 
 # ─── Lifespan: one HTTP client for the whole process ─────────────────────────
@@ -279,7 +337,7 @@ def translate_request(body: dict, tool_id_map: dict[str, str]) -> dict:
     msgs.extend(translate_messages(body.get("messages") or [], tool_id_map))
 
     payload: dict = {
-        "model": body["model"],
+        "model": resolve_model(body["model"]),
         "messages": msgs,
         "max_tokens": body.get("max_tokens", 4096),
         "stream": bool(body.get("stream", False)),
@@ -769,7 +827,7 @@ async def stream_response(
     3. Cancel the upstream task on client disconnect.
     """
     nvidia: httpx.AsyncClient = request.app.state.nvidia
-    model = body["model"]
+    model = payload["model"]
     msg_id = new_msg_id()
 
     # 1) Eager message_start — synchronous yield before any await.
@@ -890,9 +948,12 @@ def main():
     print(f"\nnvd-claude-proxy v1.0")
     print(f"  listen      → http://{PROXY_HOST}:{PROXY_PORT}")
     print(f"  upstream    → {NVIDIA_BASE_URL}")
+    print(f"  default     → {DEFAULT_MODEL}")
+    print(f"  aliases     → {len(MODEL_ALIASES)} configured")
     print(f"  point Claude Code's ANTHROPIC_BASE_URL at http://{PROXY_HOST}:{PROXY_PORT}\n")
     uvicorn.run(app, **kwargs)
 
 
 if __name__ == "__main__":
     main()
+
