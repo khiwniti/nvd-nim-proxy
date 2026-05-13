@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import os
 import signal
 import socket
@@ -14,12 +15,19 @@ from pathlib import Path
 
 import httpx
 import yaml
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
+from rich import box
+
+console = Console()
+err_console = Console(stderr=True)
 
 
 # ─── Config directory ────────────────────────────────────────────────────────
 
 def config_dir() -> Path:
-    """Return ~/.config/nim-proxy/ (or $APPDIR/nim-proxy/)."""
     base = Path(os.environ.get("APPDIR", Path.home() / ".config"))
     d = base / "nim-proxy"
     d.mkdir(parents=True, exist_ok=True)
@@ -41,7 +49,6 @@ def log_path() -> Path:
 # ─── Config loading ───────────────────────────────────────────────────────────
 
 def load_env(env_file: Path | None = None) -> None:
-    """Load .env from given path or search CWD then config dir."""
     candidates = [env_file] if env_file else [Path(".env"), config_dir() / ".env"]
     for path in candidates:
         if path and path.exists():
@@ -57,7 +64,6 @@ def load_env(env_file: Path | None = None) -> None:
 
 
 def load_config() -> dict:
-    """Search: global config → local config → empty dict."""
     for path in [global_config_path(), Path("config.yaml")]:
         if path.exists():
             try:
@@ -118,7 +124,6 @@ def remove_pid() -> None:
 
 
 def is_running() -> tuple[bool, int | None]:
-    """Return (alive, pid). Uses os.kill(pid, 0) to check without signaling."""
     pid = read_pid()
     if pid is None:
         return False, None
@@ -152,18 +157,14 @@ def wait_for_proxy(url: str, timeout: int = 15) -> bool:
 
 
 def start_daemon(config: dict) -> tuple[bool, str]:
-    """Start proxy as background daemon. Returns (success, message)."""
     alive, pid = is_running()
     if alive:
         url = get_proxy_url(config)
-        return True, f"Already running (PID {pid}) at {url}"
+        return True, f"already:{pid}:{url}"
 
     port = get_proxy_port(config)
     if is_port_in_use(port):
-        return False, (
-            f"Port {port} is already in use by another process.\n"
-            f"  Fix: change port in {global_config_path()} or stop the process using port {port}."
-        )
+        return False, f"port:{port}"
 
     proxy_py = Path(__file__).parent / "proxy.py"
     log_file = log_path()
@@ -182,17 +183,16 @@ def start_daemon(config: dict) -> tuple[bool, str]:
     url = get_proxy_url(config)
 
     if wait_for_proxy(url, timeout=15):
-        return True, f"Proxy started (PID {proc.pid}) at {url}"
+        return True, f"started:{proc.pid}:{url}"
 
     remove_pid()
-    return False, f"Proxy failed to start within 15s. Check logs: nim logs"
+    return False, "timeout"
 
 
 def stop_daemon() -> tuple[bool, str]:
-    """Stop running daemon. Returns (success, message)."""
     alive, pid = is_running()
     if not alive:
-        return True, "Proxy is not running."
+        return True, "not_running"
 
     try:
         os.kill(pid, signal.SIGTERM)
@@ -202,80 +202,173 @@ def stop_daemon() -> tuple[bool, str]:
                 os.kill(pid, 0)
             except (ProcessLookupError, OSError):
                 remove_pid()
-                return True, f"Proxy stopped (PID {pid})."
-        # Force kill if still alive after 5s
+                return True, f"stopped:{pid}"
         os.kill(pid, signal.SIGKILL)
         remove_pid()
-        return True, f"Proxy force-killed (PID {pid})."
+        return True, f"killed:{pid}"
     except Exception as e:
-        return False, f"Error stopping proxy: {e}"
+        return False, str(e)
+
+
+# ─── Rich UI helpers ──────────────────────────────────────────────────────────
+
+NVIDIA_GREEN = "bright_green"
+ACCENT = "cyan"
+DIM = "dim white"
+WARN = "yellow"
+ERR = "red"
+
+NIM_LOGO = "[bold cyan]NIM[/bold cyan] [dim]▸[/dim] [bold white]NVIDIA NIM Proxy[/bold white]"
+
+
+def _pass(label: str, detail: str = "") -> None:
+    t = Text()
+    t.append("  ✓ ", style="bold green")
+    t.append(f"{label:<36}", style="white")
+    if detail:
+        t.append(detail, style=DIM)
+    console.print(t)
+
+
+def _warn(label: str, detail: str = "") -> None:
+    t = Text()
+    t.append("  ⚠ ", style="bold yellow")
+    t.append(f"{label:<36}", style="yellow")
+    if detail:
+        t.append(detail, style=DIM)
+    console.print(t)
+
+
+def _fail(label: str, detail: str = "") -> None:
+    t = Text()
+    t.append("  ✗ ", style="bold red")
+    t.append(f"{label:<36}", style="red")
+    if detail:
+        t.append(detail, style=DIM)
+    console.print(t)
+
+
+def _env_panel(url: str) -> Panel:
+    body = Text()
+    body.append("  export ", style=DIM)
+    body.append("ANTHROPIC_BASE_URL", style="bold cyan")
+    body.append("=", style=DIM)
+    body.append(url + "\n", style="bright_white")
+    body.append("  export ", style=DIM)
+    body.append("ANTHROPIC_API_KEY", style="bold cyan")
+    body.append("=", style=DIM)
+    body.append("not-used", style="bright_white")
+    return Panel(body, title="[dim]Claude Code env vars[/dim]", border_style="dim cyan", padding=(0, 1))
 
 
 # ─── Commands ────────────────────────────────────────────────────────────────
 
 def cmd_start(args: argparse.Namespace) -> None:
     config = load_config()
-    ok, msg = start_daemon(config)
-    if ok:
-        url = get_proxy_url(config)
-        print(f"✅ {msg}")
-        print(f"\n  Export these vars for Claude Code:")
-        print(f"    export ANTHROPIC_BASE_URL={url}")
-        print(f"    export ANTHROPIC_API_KEY=not-used")
+    with console.status("[cyan]Starting proxy…[/cyan]", spinner="dots"):
+        ok, msg = start_daemon(config)
+
+    if ok and msg.startswith("already:"):
+        _, pid, url = msg.split(":", 2)
+        console.print(f"\n[yellow]●[/yellow] Already running  [dim]PID {pid}[/dim]  [cyan]{url}[/cyan]\n")
+        console.print(_env_panel(url))
+        console.print()
+    elif ok and msg.startswith("started:"):
+        _, pid, url = msg.split(":", 2)
+        console.print(f"\n[bold green]●[/bold green] Proxy started  [dim]PID {pid}[/dim]  [cyan]{url}[/cyan]\n")
+        console.print(_env_panel(url))
+        console.print()
+    elif not ok and msg.startswith("port:"):
+        port = msg.split(":")[1]
+        console.print(f"\n[red]✗[/red] Port [bold]{port}[/bold] is already in use by another process.")
+        console.print(f"  [dim]Fix:[/dim] change [cyan]server.port[/cyan] with [white]nim configure server.port <port>[/white]")
+        console.print()
+        sys.exit(1)
+    elif not ok and msg == "timeout":
+        console.print("\n[red]✗[/red] Proxy failed to start within 15 s.")
+        console.print(f"  [dim]Check logs:[/dim] [white]nim logs[/white]")
+        console.print()
+        sys.exit(1)
     else:
-        print(f"❌ {msg}")
+        console.print(f"\n[red]✗[/red] {msg}\n")
         sys.exit(1)
 
 
 def cmd_stop(args: argparse.Namespace) -> None:
-    ok, msg = stop_daemon()
-    if ok:
-        print(f"✅ {msg}")
+    with console.status("[cyan]Stopping proxy…[/cyan]", spinner="dots"):
+        ok, msg = stop_daemon()
+
+    if msg == "not_running":
+        console.print("\n[dim]● Proxy is not running.[/dim]\n")
+    elif ok and msg.startswith("stopped:"):
+        pid = msg.split(":")[1]
+        console.print(f"\n[green]●[/green] Proxy stopped  [dim]PID {pid}[/dim]\n")
+    elif ok and msg.startswith("killed:"):
+        pid = msg.split(":")[1]
+        console.print(f"\n[yellow]●[/yellow] Proxy force-killed  [dim]PID {pid}[/dim]\n")
     else:
-        print(f"❌ {msg}")
+        console.print(f"\n[red]✗[/red] {msg}\n")
         sys.exit(1)
 
 
 def cmd_restart(args: argparse.Namespace) -> None:
-    print("🔄 Restarting proxy...")
-    stop_daemon()
-    time.sleep(0.5)
-    config = load_config()
-    ok, msg = start_daemon(config)
-    if ok:
-        print(f"✅ {msg}")
+    console.print()
+    with console.status("[cyan]Restarting proxy…[/cyan]", spinner="dots"):
+        stop_daemon()
+        time.sleep(0.5)
+        config = load_config()
+        ok, msg = start_daemon(config)
+
+    if ok and (msg.startswith("started:") or msg.startswith("already:")):
+        _, pid, url = msg.split(":", 2)
+        console.print(f"[bold green]●[/bold green] Proxy running  [dim]PID {pid}[/dim]  [cyan]{url}[/cyan]\n")
     else:
-        print(f"❌ {msg}")
+        console.print(f"[red]✗[/red] {msg}\n")
         sys.exit(1)
 
 
 def cmd_logs(args: argparse.Namespace) -> None:
     lp = log_path()
     if not lp.exists():
-        print("No log file found. Start the proxy first with: nim start")
+        console.print("\n[dim]No log file found. Start the proxy first:[/dim] [white]nim start[/white]\n")
         return
 
     n = getattr(args, "lines", 50) or 50
     follow = getattr(args, "follow", False)
 
+    console.print(f"\n[dim]╸[/dim] [cyan]{lp}[/cyan]\n")
+
     if follow:
-        print(f"📋 Tailing {lp} (Ctrl+C to stop)...\n")
+        console.print("[dim]Tailing — Ctrl+C to stop[/dim]\n")
         try:
             with lp.open("r") as f:
                 f.seek(0, 2)
                 while True:
                     line = f.readline()
                     if line:
-                        print(line, end="")
+                        _print_log_line(line.rstrip())
                     else:
                         time.sleep(0.2)
         except KeyboardInterrupt:
-            pass
+            console.print("\n[dim]stopped.[/dim]")
     else:
         lines = lp.read_text(encoding="utf-8", errors="replace").splitlines()
-        print(f"📋 Last {n} lines from {lp}:\n")
         for line in lines[-n:]:
-            print(line)
+            _print_log_line(line)
+        console.print()
+
+
+def _print_log_line(line: str) -> None:
+    if "ERROR" in line or "error" in line.lower() and "deprecat" not in line.lower():
+        console.print(f"[red]{line}[/red]")
+    elif "WARNING" in line or "WARN" in line:
+        console.print(f"[yellow]{line}[/yellow]")
+    elif "startup complete" in line or "started" in line.lower():
+        console.print(f"[green]{line}[/green]")
+    elif "INFO" in line:
+        console.print(f"[dim]{line}[/dim]")
+    else:
+        console.print(line)
 
 
 def cmd_status(args: argparse.Namespace) -> None:
@@ -283,37 +376,48 @@ def cmd_status(args: argparse.Namespace) -> None:
     url = get_proxy_url(config)
     alive, pid = is_running()
 
-    print(f"NIM Proxy Status")
-    print("─" * 50)
-    print(f"  Config      : {global_config_path()}")
-    print(f"  URL         : {url}")
-    print(f"  Model       : {get_default_model(config)}")
-    print(f"  API key     : {'✅ set' if os.environ.get('NVIDIA_API_KEY') else '❌ NOT SET'}")
+    table = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
+    table.add_column("key", style="dim", no_wrap=True)
+    table.add_column("val", style="white")
+
+    table.add_row("Config", str(global_config_path()))
+    table.add_row("URL", f"[cyan]{url}[/cyan]")
+    table.add_row("Model", f"[dim]{get_default_model(config)}[/dim]")
+
+    key_set = bool(os.environ.get("NVIDIA_API_KEY"))
+    table.add_row("API Key", "[green]● set[/green]" if key_set else "[red]✗ NOT SET[/red]")
 
     if alive:
-        print(f"  Daemon      : ✅ running (PID {pid})")
+        table.add_row("Daemon", f"[bold green]● running[/bold green]  [dim]PID {pid}[/dim]")
         try:
             with httpx.Client(trust_env=False) as client:
                 r = client.get(f"{url}/healthz", timeout=2.0)
-                print(f"  Health      : {'✅ OK' if r.status_code == 200 else f'⚠️ {r.status_code}'}")
-        except Exception as e:
-            print(f"  Health      : ❌ unreachable ({e})")
+                health = "[green]● OK[/green]" if r.status_code == 200 else f"[yellow]⚠ {r.status_code}[/yellow]"
+        except Exception:
+            health = "[red]✗ unreachable[/red]"
+        table.add_row("Health", health)
     else:
-        print(f"  Daemon      : ❌ not running")
+        table.add_row("Daemon", "[dim]● not running[/dim]")
+
+    console.print(Panel(table, title=NIM_LOGO, border_style="cyan", padding=(0, 1)))
 
 
 def cmd_init(args: argparse.Namespace) -> None:
-    print("\n" + "=" * 60)
-    print("🛠️  NVIDIA NIM Proxy — Setup Wizard")
-    print("=" * 60 + "\n")
+    console.print()
+    console.print(Panel(
+        "[bold]Get a FREE key at:[/bold] [cyan underline]https://build.nvidia.com[/cyan underline]",
+        title=f"{NIM_LOGO}  [dim]Setup Wizard[/dim]",
+        border_style="cyan",
+        padding=(1, 2),
+    ))
+    console.print()
 
-    print("Get a FREE NVIDIA API key at: https://build.nvidia.com\n")
-    api_key = input("🔑 Enter your NVIDIA_API_KEY: ").strip()
+    api_key = console.input("[cyan]🔑 NVIDIA_API_KEY[/cyan] › ").strip()
     if not api_key:
-        print("❌ API key is required.")
+        console.print("[red]✗[/red] API key is required.")
         sys.exit(1)
 
-    port = input("🔌 Proxy port [8787]: ").strip() or "8787"
+    port = console.input("[cyan]🔌 Port[/cyan] [dim][8787][/dim] › ").strip() or "8787"
 
     cfg_dir = config_dir()
     env_file = cfg_dir / ".env"
@@ -325,102 +429,130 @@ def cmd_init(args: argparse.Namespace) -> None:
 
     proxy_url = f"http://127.0.0.1:{port}"
 
-    print(f"\n✅ Saved to {env_file}")
-    print(f"\nNext steps:")
-    print(f"  nim start")
-    print(f"\nThen for Claude Code, export:")
-    print(f"  export ANTHROPIC_BASE_URL={proxy_url}")
-    print(f"  export ANTHROPIC_API_KEY=not-used")
-    print(f"\nOr just run:  nim code")
+    console.print()
+    console.print(f"[green]✓[/green] Saved to [dim]{env_file}[/dim]")
+    console.print()
+    console.print(_env_panel(proxy_url))
+    console.print()
+    console.print("[dim]Next step:[/dim]  [bold white]nim start[/bold white]   [dim]then[/dim]   [bold white]nim code[/bold white]")
+    console.print()
 
 
 def cmd_doctor(args: argparse.Namespace) -> None:
     import shutil
 
-    print("\n🩺 NIM Proxy Doctor\n")
-
-    def check(label: str, ok: bool, detail: str = "") -> None:
-        icon = "✅ PASS" if ok else "❌ FAIL"
-        print(f"  {icon}  {label}")
-        if detail:
-            print(f"         {detail}")
+    console.print()
+    console.rule(f"[bold cyan]NIM Proxy Doctor[/bold cyan]", style="cyan")
+    console.print()
 
     # Python version
     v = sys.version_info
-    check("Python ≥ 3.9", v >= (3, 9), f"Found {v.major}.{v.minor}.{v.micro}")
+    if v >= (3, 9):
+        _pass("Python ≥ 3.9", f"{v.major}.{v.minor}.{v.micro}")
+    else:
+        _fail("Python ≥ 3.9", f"Found {v.major}.{v.minor} — upgrade required")
 
     # API key
     key = os.environ.get("NVIDIA_API_KEY", "")
-    check("NVIDIA_API_KEY set", bool(key), "" if key else f"Set it in {config_dir() / '.env'}")
+    if key:
+        _pass("NVIDIA_API_KEY set")
+    else:
+        _fail("NVIDIA_API_KEY set", f"Add to {config_dir() / '.env'}")
 
-    # NVIDIA API reachable
+    # NVIDIA reachable
     if key:
         try:
             with httpx.Client() as c:
                 r = c.head("https://integrate.api.nvidia.com/v1", timeout=5.0)
-                check("NVIDIA API reachable", r.status_code < 500, f"HTTP {r.status_code}")
+                if r.status_code < 500:
+                    _pass("NVIDIA API reachable", f"HTTP {r.status_code}")
+                else:
+                    _fail("NVIDIA API reachable", f"HTTP {r.status_code}")
         except Exception as e:
-            check("NVIDIA API reachable", False, str(e)[:80])
+            _fail("NVIDIA API reachable", str(e)[:60])
     else:
-        print("  ⚠️ WARN  NVIDIA API reachable  (skipped — no key)")
+        _warn("NVIDIA API reachable", "skipped — no key")
 
-    # Proxy
+    # Daemon
     config = load_config()
     alive, pid = is_running()
     url = get_proxy_url(config)
-    check("Proxy daemon running", alive, f"PID {pid} at {url}" if alive else f"Run: nim start")
+    if alive:
+        _pass("Proxy daemon running", f"PID {pid}  {url}")
+    else:
+        _fail("Proxy daemon running", "nim start")
 
     if alive:
         try:
             with httpx.Client(trust_env=False) as c:
                 r = c.get(f"{url}/healthz", timeout=2.0)
-                check("Proxy health endpoint", r.status_code == 200)
+                if r.status_code == 200:
+                    _pass("Proxy health endpoint")
+                else:
+                    _fail("Proxy health endpoint", f"HTTP {r.status_code}")
         except Exception as e:
-            check("Proxy health endpoint", False, str(e)[:80])
+            _fail("Proxy health endpoint", str(e)[:60])
 
     # Port
     port = get_proxy_port(config)
     if not alive:
-        in_use = is_port_in_use(port)
-        if in_use:
-            check("Port available", False, f"Port {port} is in use by another process")
+        if is_port_in_use(port):
+            _fail("Port available", f"Port {port} in use by another process")
         else:
-            check("Port available", True, f"Port {port} is free")
+            _pass("Port available", f"{port} is free")
 
     # Claude Code
     claude_bin = shutil.which("claude")
-    check("Claude Code installed", bool(claude_bin), claude_bin or "Install from https://claude.ai/code")
+    if claude_bin:
+        _pass("Claude Code installed", claude_bin)
+    else:
+        _fail("Claude Code installed", "https://claude.ai/code")
 
     # Config file
     gcfg = global_config_path()
-    check("Global config exists", gcfg.exists(), str(gcfg))
+    if gcfg.exists():
+        _pass("Global config exists", str(gcfg))
+    else:
+        _fail("Global config exists", f"Run: nim init")
 
-    print()
+    console.print()
 
 
 def cmd_configure(args: argparse.Namespace) -> None:
     cfg = load_config()
 
     if getattr(args, "list", False):
-        import copy
         display = copy.deepcopy(cfg)
-        # Redact secrets
         if "nvidia" in display and "api_key" in display["nvidia"]:
             display["nvidia"]["api_key"] = "****"
-        print(f"Effective config ({global_config_path()}):\n")
-        print(yaml.dump(display, default_flow_style=False) if display else "  (empty)")
+
+        table = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
+        table.add_column("key", style="cyan", no_wrap=True)
+        table.add_column("val", style="white")
+
+        def _flatten(d: dict, prefix: str = "") -> None:
+            for k, v in d.items():
+                full = f"{prefix}{k}" if not prefix else f"{prefix}.{k}"
+                if isinstance(v, dict):
+                    _flatten(v, full)
+                else:
+                    table.add_row(full, str(v))
+
+        if display:
+            _flatten(display)
+            console.print(Panel(table, title=f"[dim]{global_config_path()}[/dim]", border_style="dim cyan", padding=(0, 1)))
+        else:
+            console.print(f"\n[dim](empty — {global_config_path()})[/dim]\n")
         return
 
     key_path: str = args.key
     value: str = args.value
 
-    # Set dot-notation key, e.g. "server.port" or "nvidia.default_model"
     parts = key_path.split(".")
     node = cfg
     for part in parts[:-1]:
         node = node.setdefault(part, {})
 
-    # Try to coerce value to int/bool
     coerced: int | bool | str = value
     if value.lower() in ("true", "yes"):
         coerced = True
@@ -434,7 +566,7 @@ def cmd_configure(args: argparse.Namespace) -> None:
 
     node[parts[-1]] = coerced
     save_config(cfg)
-    print(f"✅ Set {key_path} = {coerced!r} in {global_config_path()}")
+    console.print(f"\n[green]✓[/green] [cyan]{key_path}[/cyan] = [white]{coerced!r}[/white]  [dim]({global_config_path()})[/dim]\n")
 
 
 def cmd_models(args: argparse.Namespace) -> None:
@@ -443,24 +575,31 @@ def cmd_models(args: argparse.Namespace) -> None:
     alive, _ = is_running()
 
     if not alive:
-        print("❌ Proxy is not running. Start it first: nim start")
+        console.print("\n[red]✗[/red] Proxy is not running. Start it first: [white]nim start[/white]\n")
         sys.exit(1)
 
-    try:
-        with httpx.Client(trust_env=False) as client:
-            resp = client.get(f"{url}/v1/models", timeout=5.0)
-            if resp.status_code == 200:
-                models = resp.json().get("data", [])
-                print(f"\nAvailable NVIDIA NIM Models ({url}):")
-                print("─" * 60)
-                for m in sorted(models, key=lambda x: x["id"]):
-                    print(f"  • {m['id']}")
-                print("─" * 60)
-            else:
-                print(f"❌ Error: proxy returned {resp.status_code}")
-    except Exception as e:
-        print(f"❌ Could not connect to proxy: {e}")
+    with console.status("[cyan]Fetching models…[/cyan]", spinner="dots"):
+        try:
+            with httpx.Client(trust_env=False) as client:
+                resp = client.get(f"{url}/v1/models", timeout=5.0)
+        except Exception as e:
+            console.print(f"\n[red]✗[/red] Could not connect: {e}\n")
+            sys.exit(1)
+
+    if resp.status_code != 200:
+        console.print(f"\n[red]✗[/red] Proxy returned {resp.status_code}\n")
         sys.exit(1)
+
+    models = resp.json().get("data", [])
+    table = Table(box=box.SIMPLE_HEAD, show_header=True, padding=(0, 2))
+    table.add_column("Model ID", style="cyan")
+    table.add_column("Type", style="dim")
+    for m in sorted(models, key=lambda x: x["id"]):
+        table.add_row(m["id"], m.get("object", "model"))
+
+    console.print()
+    console.print(Panel(table, title=f"[dim]NVIDIA NIM Models via {url}[/dim]", border_style="dim cyan", padding=(0, 1)))
+    console.print()
 
 
 def cmd_test(args: argparse.Namespace) -> None:
@@ -469,32 +608,44 @@ def cmd_test(args: argparse.Namespace) -> None:
     model = getattr(args, "model", None) or get_default_model(config)
     prompt = getattr(args, "prompt", None) or "Say 'proxy OK' in exactly 3 words."
 
-    print(f"🧪 Sending test message → {url}  (model: {model})")
+    console.print(f"\n[dim]Sending test →[/dim] [cyan]{url}[/cyan]  [dim]model:[/dim] [white]{model}[/white]")
+
     payload = {
         "model": model,
         "max_tokens": 64,
         "messages": [{"role": "user", "content": prompt}],
     }
 
-    try:
-        with httpx.Client(trust_env=False) as client:
-            resp = client.post(f"{url}/v1/messages", json=payload, timeout=30.0)
-            if resp.status_code == 200:
-                data = resp.json()
-                text = next(
-                    (b["text"] for b in data.get("content", []) if b.get("type") == "text"),
-                    "(no text block)",
-                )
-                print("\n" + "─" * 60)
-                print(f"Result : {text}")
-                print(f"Status : ✅ 200 OK")
-                print(f"Usage  : {data.get('usage', {})}")
-                print("─" * 60 + "\n")
-            else:
-                print(f"❌ Error {resp.status_code}: {resp.text[:200]}")
-                sys.exit(1)
-    except Exception as e:
-        print(f"❌ {e}")
+    with console.status("[cyan]Waiting for response…[/cyan]", spinner="dots"):
+        try:
+            with httpx.Client(trust_env=False) as client:
+                resp = client.post(f"{url}/v1/messages", json=payload, timeout=30.0)
+        except Exception as e:
+            console.print(f"\n[red]✗[/red] {e}\n")
+            sys.exit(1)
+
+    if resp.status_code == 200:
+        data = resp.json()
+        text = next(
+            (b["text"] for b in data.get("content", []) if b.get("type") == "text"),
+            "(no text block)",
+        )
+        usage = data.get("usage", {})
+
+        result_text = Text()
+        result_text.append(text + "\n\n", style="bold white")
+        result_text.append(
+            f"status: 200 OK   in: {usage.get('input_tokens','?')} tok   out: {usage.get('output_tokens','?')} tok",
+            style="dim",
+        )
+        console.print()
+        console.print(Panel(result_text, title="[green]✓ Test passed[/green]", border_style="green", padding=(1, 2)))
+        console.print()
+    else:
+        err_text = resp.text[:300]
+        console.print()
+        console.print(Panel(err_text, title=f"[red]✗ Error {resp.status_code}[/red]", border_style="red", padding=(1, 2)))
+        console.print()
         sys.exit(1)
 
 
@@ -505,14 +656,23 @@ def cmd_code(args: argparse.Namespace) -> None:
 
     alive, pid = is_running()
     if alive:
-        print(f"📡 Using existing proxy (PID {pid}) at {url}")
+        console.print(f"\n[dim]● Reusing proxy[/dim]  PID {pid}  [cyan]{url}[/cyan]")
     else:
-        print("📡 Starting proxy daemon...")
-        ok, msg = start_daemon(config)
+        console.print("\n[cyan]●[/cyan] Starting proxy daemon…")
+        with console.status("[cyan]Waiting for proxy to be ready…[/cyan]", spinner="dots"):
+            ok, msg = start_daemon(config)
         if not ok:
-            print(f"❌ {msg}")
+            if msg.startswith("port:"):
+                console.print(f"[red]✗[/red] Port {msg.split(':')[1]} already in use.")
+            else:
+                console.print(f"[red]✗[/red] {msg}")
             sys.exit(1)
-        print(f"✅ {msg}")
+        _, pid, url = msg.split(":", 2)
+        console.print(f"[green]●[/green] Proxy ready  [dim]PID {pid}[/dim]  [cyan]{url}[/cyan]")
+
+    console.print()
+    console.rule(f"[bold cyan]NIM[/bold cyan]  [dim]{model}[/dim]  [dim]→[/dim]  [cyan]{url}[/cyan]", style="dim cyan")
+    console.print()
 
     env = os.environ.copy()
     env["ANTHROPIC_BASE_URL"] = url
@@ -524,21 +684,18 @@ def cmd_code(args: argparse.Namespace) -> None:
     env["CLAUDE_CODE_SUBAGENT_MODEL"] = model
     env["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"] = "1"
 
-    print(f"\n{'='*60}")
-    print(f"🚀 NIM PROXY → {url}")
-    print(f"🤖 MODEL     → {model}")
-    print(f"{'='*60}\n")
-
     try:
         subprocess.run(["claude"] + (args.claude_args or []), env=env, check=False)
     except FileNotFoundError:
-        print("❌ 'claude' not found. Install Claude Code first: https://claude.ai/code")
+        console.print("\n[red]✗[/red] [bold]claude[/bold] not found. Install Claude Code: [cyan underline]https://claude.ai/code[/cyan underline]\n")
         sys.exit(1)
-    # Proxy keeps running after Claude exits — stop with: nim stop
+
+    console.print()
+    console.rule("[dim]Claude Code session ended — proxy still running[/dim]", style="dim")
+    console.print(f"[dim]  Stop with:[/dim] [white]nim stop[/white]\n")
 
 
 def cmd_proxy(args: argparse.Namespace) -> None:
-    """Start proxy in foreground (for debugging/direct use)."""
     from proxy import main as proxy_main
     proxy_main()
 
@@ -549,12 +706,12 @@ def cmd_version(args: argparse.Namespace) -> None:
         v = version("nvd-claude-nim")
     except Exception:
         try:
-            import tomllib  # Python 3.11+
+            import tomllib
         except ImportError:
             import tomli as tomllib  # type: ignore[no-redef]
         p = Path(__file__).parent / "pyproject.toml"
         v = tomllib.loads(p.read_text())["project"]["version"] if p.exists() else "unknown"
-    print(f"nvd-claude-nim {v}")
+    console.print(f"[bold cyan]nvd-claude-nim[/bold cyan] [white]{v}[/white]")
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
@@ -568,52 +725,34 @@ def main() -> None:
     )
     sub = parser.add_subparsers(dest="command", metavar="<command>")
 
-    # nim start
     sub.add_parser("start", help="Start proxy as background daemon")
-
-    # nim stop
     sub.add_parser("stop", help="Stop running daemon")
-
-    # nim restart
     sub.add_parser("restart", help="Restart daemon")
 
-    # nim logs
     logs_p = sub.add_parser("logs", help="Show proxy logs")
     logs_p.add_argument("-f", "--follow", action="store_true", help="Tail log in real time")
     logs_p.add_argument("-n", "--lines", type=int, default=50, help="Number of lines (default 50)")
 
-    # nim status
     sub.add_parser("status", help="Show proxy status")
-
-    # nim init
     sub.add_parser("init", help="Interactive setup wizard")
-
-    # nim doctor
     sub.add_parser("doctor", help="Diagnose configuration problems")
 
-    # nim configure
     cfg_p = sub.add_parser("configure", help="Set or list config values")
     cfg_p.add_argument("key", nargs="?", help="Dot-notation config key (e.g. server.port)")
     cfg_p.add_argument("value", nargs="?", help="Value to set")
     cfg_p.add_argument("--list", action="store_true", help="Print effective config")
 
-    # nim models
     sub.add_parser("models", help="List available NVIDIA models (proxy must be running)")
 
-    # nim test
     test_p = sub.add_parser("test", help="Send a test request through the proxy")
     test_p.add_argument("prompt", nargs="?", help="Custom test prompt")
     test_p.add_argument("--model", help="Override model")
 
-    # nim code
     code_p = sub.add_parser("code", help="Start proxy (if needed) then launch Claude Code")
     code_p.add_argument("--model", help="Override model")
     code_p.add_argument("claude_args", nargs="*", help="Extra args forwarded to claude")
 
-    # nim proxy
     sub.add_parser("proxy", help="Start proxy in foreground (for debugging)")
-
-    # nim version
     sub.add_parser("version", help="Show version")
 
     args = parser.parse_args()
