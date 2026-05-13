@@ -3,14 +3,14 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "nvd-claude-nim"
-version = "0.1.5"
+name = "nim-claude-proxy"
+version = "0.2.0"
 description = "Anthropic Messages → NVIDIA NIM Proxy for Claude Code"
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
 authors = [
-    { name = "NVIDIA" },
+    { name = "khiwniti" },
 ]
 keywords = [
     "anthropic",
