@@ -26,40 +26,72 @@ guide](https://docs.nvidia.com/nim/large-language-models/latest/ai-assistant-int
 
 ## Quickstart
 
+### Option 1: Install via PyPI (Recommended)
+
 ```bash
-# 1. Get a free key at https://build.nvidia.com
+# 1. Install nvd-claude-nim
+pip install nvd-claude-nim
+
+# 2. Set your NVIDIA API key (get it at https://build.nvidia.com)
+export NVIDIA_API_KEY=nvapi-...
+
+# 3. Start Claude Code with the proxy in one command
+nim code
+```
+
+### Option 2: Manual Setup (Development)
+
+```bash
+# 1. Clone and install dependencies
+git clone https://github.com/nvidia/nim-proxy
+cd nim-proxy
+pip install -r requirements.txt
+
+# 2. Configure environment
 cp .env.example .env
 $EDITOR .env   # paste NVIDIA_API_KEY
 
-# 2. Optional non-secret config
-cp config.example.yaml config.yaml
-$EDITOR config.yaml   # edit model aliases if desired; keep secrets in .env
-
-# 3. Install + run tests
-python3 -m pip install -r requirements.txt
-python3 -m pytest -q
-
-# 4. Run
-NVIDIA_API_KEY=$(grep ^NVIDIA_API_KEY .env | cut -d= -f2) python3 proxy.py
-
-# 5. In another shell, point Claude Code at the proxy
-M=nvidia/llama-3.3-nemotron-super-49b-v1.5
-export ANTHROPIC_BASE_URL=http://127.0.0.1:8787
-export ANTHROPIC_API_KEY=not-used
-export ANTHROPIC_CUSTOM_MODEL_OPTION=$M
-export ANTHROPIC_DEFAULT_HAIKU_MODEL=$M
-export ANTHROPIC_DEFAULT_OPUS_MODEL=$M
-export ANTHROPIC_DEFAULT_SONNET_MODEL=$M
-export CLAUDE_CODE_SUBAGENT_MODEL=$M
-export CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1
-claude
+# 3. Run the CLI locally
+python3 nim_code.py code
 ```
 
-> The proxy includes server-side model aliases for common Claude model names.
-> The `*_MODEL` exports are still recommended so Claude Code's UI, subagents,
-> and fallbacks consistently choose the NVIDIA-backed model you expect.
+## CLI Reference
 
-## Recommended models (all on `integrate.api.nvidia.com`, free tier)
+```
+nim start                   Start proxy as background daemon
+nim stop                    Stop the daemon
+nim restart                 Restart daemon
+nim status                  Show daemon state, PID, URL, model
+nim logs [-f] [-n N]        Show proxy logs (tail with -f)
+nim code [--model ID]       Start daemon (if needed) + launch Claude Code
+nim init                    Interactive setup wizard (saves to ~/.config/nim-proxy/)
+nim doctor                  Diagnose: API key, port, reachability, Claude Code install
+nim configure <key> <val>   Set config value (e.g. server.port, nvidia.default_model)
+nim configure --list        Print effective config (secrets redacted)
+nim models                  List NVIDIA models available through the proxy
+nim test [prompt]           Send a one-shot test message and print the result
+nim proxy                   Start proxy in foreground (for debugging)
+nim version                 Print version
+```
+
+### 2-minute quickstart
+
+```bash
+pip install nvd-claude-nim   # 1. install
+
+nim init                      # 2. enter NVIDIA_API_KEY, choose port
+
+nim start                     # 3. start daemon
+#  ✅ Proxy started (PID 12345) at http://127.0.0.1:8787
+#  export ANTHROPIC_BASE_URL=http://127.0.0.1:8787
+#  export ANTHROPIC_API_KEY=not-used
+
+nim code                      # 4. launch Claude Code (proxy already running)
+```
+
+Run `nim doctor` to diagnose problems. Run `nim stop` when done.
+
+## Configuration
 
 | Model ID                                          | Why pick it                              |
 |---------------------------------------------------|------------------------------------------|
