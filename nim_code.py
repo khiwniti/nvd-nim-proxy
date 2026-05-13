@@ -100,6 +100,28 @@ def get_default_model(config: dict) -> str:
     )
 
 
+def get_tier_models(config: dict) -> tuple[str, str, str]:
+    """Return (opus_model, sonnet_model, haiku_model) for Claude Code tier slots.
+
+    Each slot shows a flagship from a different provider so the picker offers
+    real variety across NVIDIA's catalog:
+      Opus   → deepseek-ai/deepseek-v4-pro   (DeepSeek flagship)
+      Sonnet → nvidia/llama-3.3-nemotron-super-49b-v1.5  (NVIDIA default)
+      Haiku  → minimaxai/minimax-m2.7         (MiniMax flagship)
+    """
+    nvidia = config.get("nvidia", {})
+    sonnet = get_default_model(config)
+    opus = (
+        os.environ.get("OPUS_NVIDIA_MODEL")
+        or nvidia.get("opus_model", "deepseek-ai/deepseek-v4-pro")
+    )
+    haiku = (
+        os.environ.get("HAIKU_NVIDIA_MODEL")
+        or nvidia.get("haiku_model", "minimaxai/minimax-m2.7")
+    )
+    return opus, sonnet, haiku
+
+
 # ─── PID / process helpers ───────────────────────────────────────────────────
 
 def read_pid() -> int | None:
@@ -706,10 +728,91 @@ def cmd_test(args: argparse.Namespace) -> None:
         sys.exit(1)
 
 
+# ─── Curated flagship model catalogue ────────────────────────────────────────
+
+FLAGSHIP_MODELS: list[dict] = [
+    {"p": "NVIDIA",    "id": "nvidia/llama-3.3-nemotron-super-49b-v1.5",    "desc": "best balance · tools"},
+    {"p": "NVIDIA",    "id": "nvidia/llama-3.1-nemotron-ultra-253b-v1",      "desc": "strongest reasoning"},
+    {"p": "DeepSeek",  "id": "deepseek-ai/deepseek-v4-pro",                  "desc": "flagship · deep reasoning"},
+    {"p": "DeepSeek",  "id": "deepseek-ai/deepseek-v4-flash",                "desc": "fast · low latency"},
+    {"p": "Qwen",      "id": "qwen/qwen3.5-397b-a17b",                       "desc": "397B · largest Qwen"},
+    {"p": "Qwen",      "id": "qwen/qwen3-coder-480b-a35b-instruct",          "desc": "480B MoE · best coder"},
+    {"p": "Meta",      "id": "meta/llama-4-maverick-17b-128e-instruct",      "desc": "vision + tools · Llama 4"},
+    {"p": "Meta",      "id": "meta/llama-3.3-70b-instruct",                  "desc": "general purpose"},
+    {"p": "Mistral",   "id": "mistralai/mistral-large-3-675b-instruct-2512", "desc": "675B · largest Mistral"},
+    {"p": "Mistral",   "id": "mistralai/mistral-medium-3.5-128b",            "desc": "balanced · fast"},
+    {"p": "Z-AI",      "id": "z-ai/glm-5.1",                                 "desc": "GLM flagship"},
+    {"p": "Z-AI",      "id": "z-ai/glm5",                                    "desc": "latest GLM"},
+    {"p": "MiniMax",   "id": "minimaxai/minimax-m2.7",                       "desc": "MiniMax flagship"},
+    {"p": "Moonshot",  "id": "moonshotai/kimi-k2.6",                        "desc": "Kimi flagship"},
+    {"p": "Microsoft", "id": "microsoft/phi-4-multimodal-instruct",          "desc": "multimodal · efficient"},
+    {"p": "Google",    "id": "google/gemma-4-31b-it",                        "desc": "Gemma 4 · instruction-tuned"},
+    {"p": "OpenAI",    "id": "openai/gpt-oss-120b",                          "desc": "GPT OSS 120B"},
+    {"p": "ByteDance", "id": "bytedance/seed-oss-36b-instruct",              "desc": "Seed OSS"},
+    {"p": "StepFun",   "id": "stepfun-ai/step-3.5-flash",                   "desc": "fast · step flash"},
+    {"p": "Writer",    "id": "writer/palmyra-creative-122b",                 "desc": "creative writing 122B"},
+]
+
+
+def pick_model_interactive(default_model: str) -> str:
+    """Render a numbered flagship list; return the chosen model ID."""
+    t = Table(box=box.SIMPLE, show_header=True, header_style="bold cyan",
+              pad_edge=False, show_edge=False)
+    t.add_column("#",        style="dim", width=3, justify="right")
+    t.add_column("Provider", style="bold", min_width=10)
+    t.add_column("Model",    style="cyan", min_width=44)
+    t.add_column("Notes",    style="dim")
+
+    prev_provider = ""
+    for i, m in enumerate(FLAGSHIP_MODELS, 1):
+        provider_cell = m["p"] if m["p"] != prev_provider else ""
+        note = m["desc"]
+        if m["id"] == default_model:
+            note += "  [green]← default[/green]"
+        t.add_row(str(i), provider_cell, m["id"], note)
+        prev_provider = m["p"]
+
+    console.print()
+    console.print(Panel(
+        t,
+        title="[bold cyan]Select a model[/bold cyan]",
+        subtitle="[dim]any model ID from build.nvidia.com also works[/dim]",
+        border_style="cyan", padding=(1, 2),
+    ))
+    console.print(
+        f"[dim]Number, model ID, or Enter for default "
+        f"([cyan]{default_model}[/cyan])[/dim]: ",
+        end="",
+    )
+    try:
+        raw = input().strip()
+    except (EOFError, KeyboardInterrupt):
+        console.print()
+        return default_model
+
+    if not raw:
+        return default_model
+    if raw.isdigit():
+        idx = int(raw) - 1
+        if 0 <= idx < len(FLAGSHIP_MODELS):
+            chosen = FLAGSHIP_MODELS[idx]["id"]
+            console.print(f"[green]✓[/green] [cyan]{chosen}[/cyan]")
+            return chosen
+        console.print("[yellow]⚠[/yellow] Invalid number — using default")
+        return default_model
+    console.print(f"[green]✓[/green] [cyan]{raw}[/cyan]")
+    return raw
+
+
 def cmd_code(args: argparse.Namespace) -> None:
     config = load_config()
     url = get_proxy_url(config)
-    model = getattr(args, "model", None) or get_default_model(config)
+
+    model = getattr(args, "model", None)
+    if not model and sys.stdin.isatty():
+        model = pick_model_interactive(get_default_model(config))
+    if not model:
+        model = get_default_model(config)
 
     alive, pid = is_running()
     if alive:
@@ -731,14 +834,16 @@ def cmd_code(args: argparse.Namespace) -> None:
     console.rule(f"[bold cyan]NIM[/bold cyan]  [dim]{model}[/dim]  [dim]→[/dim]  [cyan]{url}[/cyan]", style="dim cyan")
     console.print()
 
+    opus_model, sonnet_model, haiku_model = get_tier_models(config)
+
     env = os.environ.copy()
     env["ANTHROPIC_BASE_URL"] = url
     env["ANTHROPIC_API_KEY"] = env.get("ANTHROPIC_API_KEY", "not-used")
     env["ANTHROPIC_CUSTOM_MODEL_OPTION"] = model
-    env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = model
-    env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = model
-    env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = model
-    env["CLAUDE_CODE_SUBAGENT_MODEL"] = model
+    env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = haiku_model
+    env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = opus_model
+    env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = sonnet_model
+    env["CLAUDE_CODE_SUBAGENT_MODEL"] = haiku_model
     env["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"] = "1"
 
     try:

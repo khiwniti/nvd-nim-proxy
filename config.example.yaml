@@ -11,7 +11,15 @@ nvidia:
   base_url: https://integrate.api.nvidia.com/v1
   # Prefer NVIDIA_API_KEY env var instead of storing the key here.
   # api_key: nvapi-...
+
+  # Default / "Sonnet" tier — shown as the primary model in nim code picker
   default_model: nvidia/llama-3.3-nemotron-super-49b-v1.5
+
+  # "Opus" tier — DeepSeek flagship
+  opus_model: deepseek-ai/deepseek-v4-pro
+
+  # "Haiku" tier — MiniMax flagship
+  haiku_model: minimaxai/minimax-m2.7
 
 streaming:
   ping_interval: 15.0

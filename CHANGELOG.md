@@ -1,0 +1,89 @@
+# Changelog
+
+All notable changes to **nim-claude-proxy** are documented here.
+Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+
+---
+
+## [Unreleased]
+
+### Added
+- Interactive model picker shown before `nim code` launches — 20 flagship models
+  from NVIDIA, DeepSeek, Qwen, Mistral, Z-AI, MiniMax, Moonshot, Meta, Google,
+  OpenAI OSS, ByteDance, StepFun, and Writer; type a number, a model ID, or
+  Enter for the default.
+- `FLAGSHIP_MODELS` catalogue in `nim_code.py`; easily extended.
+- `pick_model_interactive()` helper — skipped when `--model` is passed or stdin
+  is non-TTY (scripts, CI).
+- Per-tier model config: `nvidia.opus_model` and `nvidia.haiku_model` in
+  `config.yaml` set the Opus and Haiku slots in Claude Code's own picker.
+- `get_tier_models()` helper; env-var overrides `OPUS_NVIDIA_MODEL` /
+  `HAIKU_NVIDIA_MODEL` take precedence over config.
+- `CLAUDE_CODE_SUBAGENT_MODEL` wired to the Haiku-tier model (fast model for
+  background sub-agents).
+
+### Changed
+- Default Opus slot: `deepseek-ai/deepseek-v4-pro` (was NVIDIA Ultra 253B).
+- Default Haiku slot: `minimaxai/minimax-m2.7` (was nano-9b-v2).
+- `config.example.yaml` documents all three tier-model fields.
+
+---
+
+## [0.2.0] — 2025-05-14
+
+### Added
+- `nim use <model>` — switch default model instantly; restarts daemon if running.
+- `nim models` — list available NVIDIA NIM models via the proxy.
+- CI/CD via GitHub Actions:
+  - `ci.yml` — pytest matrix on Python 3.9 / 3.11 / 3.12 on push and PR.
+  - `publish.yml` — auto-publish to PyPI on `v*` tags using `PYPI_TOKEN` secret.
+- `_nvidia_error_message()` helper — correctly extracts the message from
+  NVIDIA's nested `{"error":{"message":"..."}}` envelope.
+- Eager `message_start` emission before any upstream await (sub-100 ms TTFT).
+- 15 s ping heartbeat during long reasoning turns to keep the TUI alive.
+- HTTP/2 to NVIDIA when the `h2` package is installed.
+- Client-disconnect cancellation via `asyncio` task cleanup.
+- Token counting endpoint `/v1/messages/count_tokens` (heuristic ±15 %).
+- `nimr` / `nim-proxy` CLI entry points in `pyproject.toml`.
+- Rich-styled terminal output throughout the CLI (panels, tables, spinners).
+- Production daemon: PID file at `~/.config/nim-proxy/nim-proxy.pid`,
+  SIGTERM → wait → SIGKILL lifecycle, `start_new_session=True` for detachment.
+- `nim init`, `nim start`, `nim stop`, `nim restart`, `nim status`,
+  `nim logs [-f] [-n N]`, `nim doctor`, `nim configure`, `nim test`,
+  `nim proxy`, `nim version` commands.
+- Global config at `~/.config/nim-proxy/config.yaml`; env vars override YAML.
+- `PROXY_API_KEY` optional client-facing auth with `hmac.compare_digest`.
+- 20 tests covering translation, streaming, routes, and error extraction.
+
+### Fixed
+- `ORJSONResponse` deprecation — replaced with `JSONResp()` helper using
+  `Response(content=orjson.dumps(...), media_type="application/json")`.
+- Timing attack in `check_auth()` — plain `!=` replaced with
+  `hmac.compare_digest()`.
+- `/v1/models` crashing on non-JSON upstream responses.
+- `image_block_to_openai()` raising unhandled `ValueError` on unknown source types.
+- Streaming producer: error body now sent as a `(ERROR, status, body)` queue
+  tuple instead of baked into an exception string.
+- Leaked real NVIDIA API key redacted from `.env.example`.
+
+### Changed
+- Package renamed from `nvd-claude-nim` → `nim-claude-proxy` (PyPI conflict).
+- Package version bumped `0.1.5` → `0.2.0`.
+- Author updated to `khiwniti`.
+- `rich>=13.0` added to dependencies.
+- README fully rewritten: badges, ASCII architecture diagram, quickstart,
+  CLI reference table, model recommendations, feature matrix, troubleshooting.
+
+---
+
+## [0.1.5] — initial development
+
+### Added
+- YAML config loader and model alias resolution.
+- Request/response translation: Anthropic Messages API → OpenAI Chat Completions.
+- Streaming SSE translation (`StreamTranslator`).
+- Tool call round-trip (`tool_use` ↔ `tool_calls`).
+- System prompt handling (string and block-array forms).
+- Vision support (base64 + URL image blocks).
+- Reasoning block support (`reasoning_content` + `<think>` tag stripping).
+- Spec Kit artifacts, initial test suite, and Git extension scaffolding.
