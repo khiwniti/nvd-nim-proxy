@@ -186,6 +186,18 @@ def new_signature() -> str:
 # These have no NVIDIA equivalent; we drop them silently.
 SERVER_TOOL_RE = re.compile(r"_20\d{6}$")
 
+# STRICT protocol injection to prevent models from hallucinating tags
+# instead of using the native tool-calling API.
+_TOOL_PROTOCOL_SYSTEM_PROMPT = """
+# Tool Use Protocol (STRICT)
+You are an expert at tool use. You MUST ALWAYS follow these rules:
+1. ALWAYS use the native `tool_calls` API for all tool interactions.
+2. NEVER output tags like `<command-name>`, `<command-arguments>`, or similar.
+3. If you need to call a tool, generate the `tool_calls` field in your response. 
+4. DO NOT explain your tool call or output any text before the tool call if possible.
+5. If you hallucinate a tag, you will be stopped. Use ONLY JSON for tool calls.
+"""
+
 
 def flatten_system(system) -> str | None:
     if system is None:
@@ -296,15 +308,29 @@ def translate_tools(tools: list[dict] | None) -> list[dict] | None:
     if not tools:
         return None
     out = []
+    tool_count = len(tools)
+    
+    # Aggressively cap descriptions if many tools are present to fit context
+    desc_cap = 480
+    if tool_count > 100:
+        desc_cap = 160
+    elif tool_count > 40:
+        desc_cap = 280
+
     for t in tools:
         # Skip Anthropic server-side tools — no NVIDIA equivalent
         if SERVER_TOOL_RE.search(t.get("type") or ""):
             continue
+            
+        desc = t.get("description") or ""
+        if len(desc) > desc_cap:
+            desc = desc[:desc_cap] + "..."
+
         out.append({
             "type": "function",
             "function": {
                 "name": t["name"],
-                "description": t.get("description") or "",
+                "description": desc,
                 "parameters": t.get("input_schema") or {
                     "type": "object", "properties": {}
                 },
@@ -332,14 +358,29 @@ def translate_tool_choice(tc):
 
 def translate_request(body: dict, tool_id_map: dict[str, str]) -> dict:
     msgs: list[dict] = []
-    if (sys := flatten_system(body.get("system"))):
+    sys = flatten_system(body.get("system"))
+
+    # Inject tool protocol if tools are present
+    if body.get("tools"):
+        if sys:
+            sys = _TOOL_PROTOCOL_SYSTEM_PROMPT.strip() + "\n\n" + sys
+        else:
+            sys = _TOOL_PROTOCOL_SYSTEM_PROMPT.strip()
+
+    if sys:
         msgs.append({"role": "system", "content": sys})
+
     msgs.extend(translate_messages(body.get("messages") or [], tool_id_map))
+
+    # Clamp max_tokens to a safe default if missing or too high
+    max_tokens = body.get("max_tokens", 4096)
+    if max_tokens > 16384:
+        max_tokens = 16384
 
     payload: dict = {
         "model": resolve_model(body["model"]),
         "messages": msgs,
-        "max_tokens": body.get("max_tokens", 4096),
+        "max_tokens": max_tokens,
         "stream": bool(body.get("stream", False)),
     }
     for key in ("temperature", "top_p", "top_k"):
@@ -713,6 +754,30 @@ def map_error_type(status: int) -> str:
     return STATUS_TO_ERR.get(status, "api_error")
 
 
+def _nvidia_error_message(body: dict | str) -> str:
+    """Extract a human-readable message from NVIDIA/OpenAI error payloads.
+
+    NVIDIA wraps errors as {"error": {"message": "...", "type": "BadRequestError"}}.
+    Falls back to top-level "message"/"detail" and then raw text.
+    """
+    if isinstance(body, (bytes, bytearray)):
+        try:
+            body = json.loads(body)
+        except Exception:
+            return body.decode(errors="replace")[:500]
+    if isinstance(body, str):
+        try:
+            body = json.loads(body)
+        except Exception:
+            return body[:500]
+    if isinstance(body, dict):
+        err = body.get("error")
+        if isinstance(err, dict):
+            return str(err.get("message") or err.get("detail") or err)[:500]
+        return str(body.get("message") or body.get("detail") or body)[:500]
+    return str(body)[:500]
+
+
 def check_auth(request: Request):
     if not PROXY_API_KEY:
         return
@@ -794,13 +859,13 @@ async def messages(request: Request):
             )
         if resp.status_code >= 400:
             try:
-                body_err = resp.json().get("detail") or resp.json().get("message") or resp.text
+                body_err = _nvidia_error_message(resp.json())
             except Exception:
-                body_err = resp.text
+                body_err = resp.text[:500]
             return ORJSONResponse(
                 {"type": "error",
                  "error": {"type": map_error_type(resp.status_code),
-                           "message": str(body_err)[:500]}},
+                           "message": body_err}},
                 status_code=resp.status_code,
             )
         return ORJSONResponse(translate_response(resp.json(), body["model"], tool_id_map))
@@ -868,11 +933,12 @@ async def stream_response(
             ) as r:
                 if r.status_code >= 400:
                     body_bytes = await r.aread()
-                    raise httpx.HTTPStatusError(
-                        f"NVIDIA {r.status_code}: "
-                        f"{body_bytes.decode(errors='replace')[:500]}",
-                        request=r.request, response=r,
-                    )
+                    try:
+                        err_body = json.loads(body_bytes)
+                    except Exception:
+                        err_body = body_bytes.decode(errors="replace")
+                    await queue.put((ERROR, r.status_code, err_body))
+                    return
                 async for line in r.aiter_lines():
                     if not line or not line.startswith("data:"):
                         continue
@@ -884,7 +950,7 @@ async def stream_response(
                     except json.JSONDecodeError:
                         continue
         except Exception as e:  # noqa: BLE001
-            await queue.put((ERROR, e))
+            await queue.put((ERROR, None, str(e)))
         finally:
             await queue.put(DONE)
 
@@ -902,13 +968,13 @@ async def stream_response(
             if item is DONE:
                 break
             if isinstance(item, tuple) and item and item[0] is ERROR:
-                exc = item[1]
-                status = getattr(getattr(exc, "response", None), "status_code", 500)
+                _, status, err_body = item
+                msg = _nvidia_error_message(err_body) if isinstance(err_body, (dict, str, bytes)) else str(err_body)[:500]
                 yield encode_sse("error", {
                     "type": "error",
                     "error": {
-                        "type": map_error_type(status),
-                        "message": str(exc)[:500],
+                        "type": map_error_type(status or 500),
+                        "message": msg,
                     },
                 })
                 break

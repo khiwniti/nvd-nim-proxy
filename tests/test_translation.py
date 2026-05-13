@@ -32,7 +32,8 @@ def test_translate_request_maps_model_and_system_and_tool():
     }
     out = proxy.translate_request(body, tool_id_map)
     assert out["model"] != body["model"]
-    assert out["messages"][0] == {"role": "system", "content": "You are useful."}
+    assert "Tool Use Protocol (STRICT)" in out["messages"][0]["content"]
+    assert "You are useful." in out["messages"][0]["content"]
     assert out["messages"][1] == {"role": "user", "content": "hi"}
     assert out["tools"][0]["function"]["name"] == "read_file"
     assert len(out["tools"]) == 1
@@ -89,3 +90,25 @@ def test_error_type_mapping():
     assert proxy.map_error_type(429) == "rate_limit_error"
     assert proxy.map_error_type(529) == "overloaded_error"
     assert proxy.map_error_type(418) == "api_error"
+
+
+def test_nvidia_error_message_nested_envelope():
+    # NVIDIA wraps errors: {"error": {"message": "...", "type": "BadRequestError"}}
+    body = {"error": {"message": "context length exceeded", "type": "BadRequestError"}}
+    assert proxy._nvidia_error_message(body) == "context length exceeded"
+
+
+def test_nvidia_error_message_top_level_fallback():
+    # Some gateways return top-level "message"
+    body = {"message": "rate limit hit"}
+    assert proxy._nvidia_error_message(body) == "rate limit hit"
+
+
+def test_nvidia_error_message_raw_string():
+    assert proxy._nvidia_error_message("plain error text") == "plain error text"
+
+
+def test_nvidia_error_message_json_string():
+    # JSON embedded in a string (streaming error path)
+    raw = '{"error": {"message": "token limit exceeded", "type": "BadRequestError"}}'
+    assert proxy._nvidia_error_message(raw) == "token limit exceeded"
