@@ -46,8 +46,9 @@ import httpx
 import orjson
 import uvicorn
 import yaml
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import ORJSONResponse, StreamingResponse
+import hmac
+from fastapi import FastAPI, Request
+from fastapi.responses import Response, StreamingResponse
 
 
 # ─── Config ──────────────────────────────────────────────────────────────────
@@ -155,12 +156,11 @@ async def lifespan(app: FastAPI):
     await app.state.nvidia.aclose()
 
 
-app = FastAPI(
-    title="nvd-claude-proxy",
-    version="1.0.0",
-    lifespan=lifespan,
-    default_response_class=ORJSONResponse,
-)
+app = FastAPI(title="nvd-claude-proxy", version="1.0.0", lifespan=lifespan)
+
+
+def JSONResp(data: dict, status_code: int = 200) -> Response:
+    return Response(content=orjson.dumps(data), status_code=status_code, media_type="application/json")
 
 
 # ─── ID helpers ──────────────────────────────────────────────────────────────
@@ -218,7 +218,7 @@ def image_block_to_openai(block: dict) -> dict:
             "type": "image_url",
             "image_url": {"url": f"data:{src['media_type']};base64,{src['data']}"},
         }
-    raise ValueError(f"unsupported image source type: {t}")
+    return {"type": "text", "text": f"[unsupported image source type: {t}]"}
 
 
 def translate_messages(
@@ -785,11 +785,11 @@ def check_auth(request: Request):
         request.headers.get("x-api-key")
         or request.headers.get("authorization", "").removeprefix("Bearer ").strip()
     )
-    if presented != PROXY_API_KEY:
-        raise HTTPException(401, {
-            "type": "error",
-            "error": {"type": "authentication_error", "message": "invalid proxy api key"},
-        })
+    if not hmac.compare_digest(presented, PROXY_API_KEY):
+        return JSONResp(
+            {"type": "error", "error": {"type": "authentication_error", "message": "invalid proxy api key"}},
+            status_code=401,
+        )
 
 
 @app.get("/healthz")
@@ -800,9 +800,19 @@ async def healthz():
 @app.get("/v1/models")
 async def list_models(request: Request):
     """Proxy NVIDIA's /v1/models verbatim."""
+    auth = check_auth(request)
+    if auth is not None:
+        return auth
     nvidia: httpx.AsyncClient = request.app.state.nvidia
-    r = await nvidia.get("/models")
-    return ORJSONResponse(r.json(), status_code=r.status_code)
+    try:
+        r = await nvidia.get("/models")
+        try:
+            data = r.json()
+        except Exception:
+            data = {"object": "list", "data": []}
+        return JSONResp(data, status_code=r.status_code)
+    except httpx.HTTPError as e:
+        return JSONResp({"type": "error", "error": {"type": "api_error", "message": str(e)[:500]}}, status_code=502)
 
 
 @app.post("/v1/messages/count_tokens")
@@ -821,7 +831,7 @@ async def count_tokens(request: Request):
             return len(o)
         return 0
 
-    return ORJSONResponse({"input_tokens": max(walk(body) // 4, 1)})
+    return JSONResp({"input_tokens": max(walk(body) // 4, 1)})
 
 
 @app.post("/v1/messages")
@@ -830,13 +840,13 @@ async def messages(request: Request):
     try:
         body = await request.json()
     except Exception as e:
-        return ORJSONResponse(
+        return JSONResp(
             {"type": "error",
              "error": {"type": "invalid_request_error", "message": f"bad JSON: {e}"}},
             status_code=400,
         )
     if "model" not in body or "messages" not in body:
-        return ORJSONResponse(
+        return JSONResp(
             {"type": "error",
              "error": {"type": "invalid_request_error",
                        "message": "model and messages are required"}},
@@ -852,7 +862,7 @@ async def messages(request: Request):
         try:
             resp = await nvidia.post("/chat/completions", json=payload)
         except httpx.HTTPError as e:
-            return ORJSONResponse(
+            return JSONResp(
                 {"type": "error",
                  "error": {"type": "api_error", "message": str(e)[:500]}},
                 status_code=502,
@@ -862,13 +872,13 @@ async def messages(request: Request):
                 body_err = _nvidia_error_message(resp.json())
             except Exception:
                 body_err = resp.text[:500]
-            return ORJSONResponse(
+            return JSONResp(
                 {"type": "error",
                  "error": {"type": map_error_type(resp.status_code),
                            "message": body_err}},
                 status_code=resp.status_code,
             )
-        return ORJSONResponse(translate_response(resp.json(), body["model"], tool_id_map))
+        return JSONResp(translate_response(resp.json(), body["model"], tool_id_map))
 
     # Streaming path
     return StreamingResponse(
