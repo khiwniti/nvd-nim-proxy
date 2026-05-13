@@ -602,6 +602,63 @@ def cmd_models(args: argparse.Namespace) -> None:
     console.print()
 
 
+def cmd_use(args: argparse.Namespace) -> None:
+    model: str = args.model.strip()
+
+    # Basic validation: NIM model IDs contain at least one "/"
+    if "/" not in model:
+        console.print(f"\n[red]✗[/red] [bold]{model}[/bold] doesn't look like a NIM model ID.")
+        console.print("  Expected format: [cyan]<provider>/<model-name>[/cyan]")
+        console.print("  Examples: [white]qwen/qwen3-235b-a22b[/white]  [white]meta/llama-3.3-70b-instruct[/white]  [white]z-ai/glm-5.1[/white]\n")
+        sys.exit(1)
+
+    cfg = load_config()
+    old_model = get_default_model(cfg)
+    cfg.setdefault("nvidia", {})["default_model"] = model
+    save_config(cfg)
+
+    # If daemon is running, restart so it picks up the new default
+    alive, pid = is_running()
+    restarted = False
+    if alive:
+        with console.status("[cyan]Restarting proxy with new model…[/cyan]", spinner="dots"):
+            stop_daemon()
+            time.sleep(0.4)
+            ok, msg = start_daemon(cfg)
+        restarted = ok
+
+    console.print()
+
+    body = Text()
+    body.append("  Model  ", style="dim")
+    body.append(model, style="bold cyan")
+    body.append("\n\n", style="")
+    body.append(f"  was    ", style="dim")
+    body.append(old_model, style="dim white")
+    if restarted:
+        body.append("\n\n  ", style="")
+        body.append("Proxy restarted — new model active immediately.", style="green")
+    else:
+        body.append("\n\n  ", style="")
+        body.append("Run ", style="dim")
+        body.append("nim start", style="white")
+        body.append(" to apply.", style="dim")
+
+    console.print(Panel(
+        body,
+        title="[bold green]✓ Active model updated[/bold green]",
+        border_style="green",
+        padding=(1, 2),
+    ))
+    console.print()
+
+    # Print ready-to-paste one-liner
+    console.print("[dim]One-shot override (no config change):[/dim]")
+    console.print(f"  [white]nim code --model {model}[/white]\n")
+    console.print("[dim]Test the new model now:[/dim]")
+    console.print(f"  [white]nim test --model {model}[/white]\n")
+
+
 def cmd_test(args: argparse.Namespace) -> None:
     config = load_config()
     url = get_proxy_url(config)
@@ -744,6 +801,9 @@ def main() -> None:
 
     sub.add_parser("models", help="List available NVIDIA models (proxy must be running)")
 
+    use_p = sub.add_parser("use", help="Switch active model (e.g. nim use qwen/qwen3-235b-a22b)")
+    use_p.add_argument("model", help="NIM model ID — any provider/model from build.nvidia.com")
+
     test_p = sub.add_parser("test", help="Send a test request through the proxy")
     test_p.add_argument("prompt", nargs="?", help="Custom test prompt")
     test_p.add_argument("--model", help="Override model")
@@ -758,6 +818,7 @@ def main() -> None:
     args = parser.parse_args()
 
     dispatch = {
+        "use": cmd_use,
         "start": cmd_start,
         "stop": cmd_stop,
         "restart": cmd_restart,

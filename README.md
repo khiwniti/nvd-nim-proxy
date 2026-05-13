@@ -60,6 +60,31 @@ NVIDIA_API_KEY=nvapi-... nim code
 
 ---
 
+## ⚡ Instant Model Switching
+
+Switch to **any model** on NVIDIA's catalog in one command — no config file editing, no restart required:
+
+```bash
+# Switch your default model permanently
+nim use qwen/qwen3-235b-a22b
+nim use z-ai/glm-5.1
+nim use meta/llama-4-maverick-17b-128e-instruct
+nim use nvidia/llama-3.1-nemotron-ultra-253b-v1
+
+# One-session override (default unchanged)
+nim code --model qwen/qwen3-235b-a22b
+nim test --model z-ai/glm-5.1
+
+# Test any model immediately
+nim test --model meta/llama-3.3-70b-instruct "Write a haiku about GPUs"
+```
+
+`nim use` saves the model to `~/.config/nim-proxy/config.yaml` and restarts the proxy automatically if it's running. Any model ID from [build.nvidia.com](https://build.nvidia.com) works — no aliases, no mapping needed.
+
+> **How it works:** The proxy passes any `provider/model` ID straight to NVIDIA unchanged. Only `claude-*` names get remapped to your configured NVIDIA model. Everything else is zero-friction passthrough.
+
+---
+
 ## CLI Reference
 
 | Command | Description |
@@ -74,6 +99,7 @@ NVIDIA_API_KEY=nvapi-... nim code
 | `nim doctor` | Diagnose: Python, key, NVIDIA API, port, health, Claude install |
 | `nim configure <key> <val>` | Set a config value (`server.port`, `nvidia.default_model`, …) |
 | `nim configure --list` | Print effective config (secrets redacted) |
+| `nim use <model>` | **Switch model instantly** — saves config + restarts daemon |
 | `nim models` | List available NVIDIA NIM models |
 | `nim test [prompt]` | Send a one-shot test request and show the result |
 | `nim proxy` | Start proxy in foreground (debugging) |
