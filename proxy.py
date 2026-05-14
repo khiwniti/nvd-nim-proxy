@@ -778,6 +778,21 @@ def _nvidia_error_message(body: dict | str) -> str:
     return str(body)[:500]
 
 
+_CTX_OVERFLOW_RE = re.compile(
+    r"passed (\d+) input tokens and requested (\d+).*?context length is only (\d+)",
+    re.DOTALL,
+)
+
+def _context_safe_max_tokens(err_msg: str) -> int | None:
+    """Return a reduced max_tokens that fits inside the model context, or None."""
+    m = _CTX_OVERFLOW_RE.search(err_msg)
+    if not m:
+        return None
+    input_toks, ctx = int(m.group(1)), int(m.group(3))
+    safe = ctx - input_toks - 1
+    return safe if safe > 0 else None
+
+
 def check_auth(request: Request):
     if not PROXY_API_KEY:
         return
@@ -872,6 +887,18 @@ async def messages(request: Request):
                 body_err = _nvidia_error_message(resp.json())
             except Exception:
                 body_err = resp.text[:500]
+            # Auto-retry once with reduced max_tokens on context-length overflow
+            if resp.status_code == 400:
+                safe = _context_safe_max_tokens(body_err)
+                if safe is not None:
+                    payload["max_tokens"] = safe
+                    try:
+                        resp = await nvidia.post("/chat/completions", json=payload)
+                        if resp.status_code < 400:
+                            return JSONResp(translate_response(resp.json(), body["model"], tool_id_map))
+                        body_err = _nvidia_error_message(resp.json())
+                    except httpx.HTTPError:
+                        pass
             return JSONResp(
                 {"type": "error",
                  "error": {"type": map_error_type(resp.status_code),
@@ -938,27 +965,35 @@ async def stream_response(
 
     async def producer():
         try:
-            async with nvidia.stream(
-                "POST", "/chat/completions", json=payload
-            ) as r:
-                if r.status_code >= 400:
-                    body_bytes = await r.aread()
-                    try:
-                        err_body = json.loads(body_bytes)
-                    except Exception:
-                        err_body = body_bytes.decode(errors="replace")
-                    await queue.put((ERROR, r.status_code, err_body))
-                    return
-                async for line in r.aiter_lines():
-                    if not line or not line.startswith("data:"):
-                        continue
-                    data = line[5:].lstrip()
-                    if data == "[DONE]":
-                        break
-                    try:
-                        await queue.put(json.loads(data))
-                    except json.JSONDecodeError:
-                        continue
+            for attempt in range(2):
+                async with nvidia.stream(
+                    "POST", "/chat/completions", json=payload
+                ) as r:
+                    if r.status_code >= 400:
+                        body_bytes = await r.aread()
+                        try:
+                            err_body = json.loads(body_bytes)
+                        except Exception:
+                            err_body = body_bytes.decode(errors="replace")
+                        # Auto-retry once on context-length overflow
+                        if r.status_code == 400 and attempt == 0:
+                            safe = _context_safe_max_tokens(_nvidia_error_message(err_body))
+                            if safe is not None:
+                                payload["max_tokens"] = safe
+                                continue
+                        await queue.put((ERROR, r.status_code, err_body))
+                        return
+                    async for line in r.aiter_lines():
+                        if not line or not line.startswith("data:"):
+                            continue
+                        data = line[5:].lstrip()
+                        if data == "[DONE]":
+                            break
+                        try:
+                            await queue.put(json.loads(data))
+                        except json.JSONDecodeError:
+                            continue
+                    return  # success — stop retry loop
         except Exception as e:  # noqa: BLE001
             await queue.put((ERROR, None, str(e)))
         finally:

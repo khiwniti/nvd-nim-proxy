@@ -112,3 +112,27 @@ def test_nvidia_error_message_json_string():
     # JSON embedded in a string (streaming error path)
     raw = '{"error": {"message": "token limit exceeded", "type": "BadRequestError"}}'
     assert proxy._nvidia_error_message(raw) == "token limit exceeded"
+
+
+def test_context_safe_max_tokens_parses_nvidia_overflow():
+    # Real NVIDIA context-overflow message format
+    msg = (
+        "You passed 186369 input tokens and requested 16384 output tokens. "
+        "However, the model's context length is only 202752 tokens, resulting "
+        "in a maximum input length of 186368 tokens."
+    )
+    safe = proxy._context_safe_max_tokens(msg)
+    assert safe == 202752 - 186369 - 1  # == 16382
+
+
+def test_context_safe_max_tokens_returns_none_for_unrelated_error():
+    assert proxy._context_safe_max_tokens("rate limit exceeded") is None
+
+
+def test_context_safe_max_tokens_returns_none_when_no_room():
+    # input_tokens == context_window → no safe max_tokens
+    msg = (
+        "You passed 202752 input tokens and requested 1 output tokens. "
+        "However, the model's context length is only 202752 tokens."
+    )
+    assert proxy._context_safe_max_tokens(msg) is None
