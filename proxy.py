@@ -55,14 +55,49 @@ from fastapi.responses import Response, StreamingResponse
 
 DEFAULT_NVIDIA_MODEL = "nvidia/llama-3.3-nemotron-super-49b-v1.5"
 DEFAULT_MODEL_ALIASES = {
-    # Common Claude Code model names and families. Users can override or extend
-    # these in config.yaml under model_aliases or with MODEL_ALIAS_* env vars.
-    "claude-3-5-sonnet-20241022": DEFAULT_NVIDIA_MODEL,
+    # ── Standard Claude Code aliases ─────────────────────────────────────────
+    # Mapped to meaningful NVIDIA equivalents by capability tier so that
+    # switching models in Claude Desktop actually changes the backend.
+    "claude-haiku-4-5":          "meta/llama-3.1-8b-instruct",           # fast / cheap
+    "claude-3-5-sonnet-20241022": DEFAULT_NVIDIA_MODEL,                   # balanced
     "claude-3-7-sonnet-20250219": DEFAULT_NVIDIA_MODEL,
-    "claude-sonnet-4-20250514": DEFAULT_NVIDIA_MODEL,
-    "claude-sonnet-4-5": DEFAULT_NVIDIA_MODEL,
-    "claude-haiku-4-5": DEFAULT_NVIDIA_MODEL,
-    "claude-opus-4-1": DEFAULT_NVIDIA_MODEL,
+    "claude-sonnet-4-20250514":  DEFAULT_NVIDIA_MODEL,
+    "claude-sonnet-4-5":         DEFAULT_NVIDIA_MODEL,
+    "claude-opus-4-1":           "nvidia/llama-3.1-nemotron-ultra-253b-v1",  # most capable
+
+    # ── NVIDIA catalog exposed as claude-nvidia-* ─────────────────────────
+    # Claude Desktop only renders models whose id starts with "claude-".
+    # These aliases make NVIDIA models selectable in the model picker.
+
+    # Nemotron family
+    "claude-nvidia-nemotron-super-49b":  "nvidia/llama-3.3-nemotron-super-49b-v1.5",
+    "claude-nvidia-nemotron-ultra-253b": "nvidia/llama-3.1-nemotron-ultra-253b-v1",
+    "claude-nvidia-nemotron-70b":        "nvidia/llama-3.1-nemotron-70b-instruct",
+    "claude-nvidia-nemotron-nano-8b":    "nvidia/llama-3.1-nemotron-nano-8b-v1",
+
+    # Meta Llama
+    "claude-nvidia-llama-70b":  "meta/llama-3.3-70b-instruct",
+    "claude-nvidia-llama-8b":   "meta/llama-3.1-8b-instruct",
+    "claude-nvidia-llama-maverick": "meta/llama-4-maverick-17b-128e-instruct",
+
+    # DeepSeek
+    "claude-nvidia-deepseek-v4-pro":   "deepseek-ai/deepseek-v4-pro",
+    "claude-nvidia-deepseek-v4-flash": "deepseek-ai/deepseek-v4-flash",
+
+    # Mistral
+    "claude-nvidia-mistral-large":  "mistralai/mistral-large-2-instruct",
+    "claude-nvidia-mistral-medium": "mistralai/mistral-medium-3.5-128b",
+
+    # Qwen
+    "claude-nvidia-qwen3-coder":   "qwen/qwen3-coder-480b-a35b-instruct",
+    "claude-nvidia-qwen3-80b":     "qwen/qwen3-next-80b-a3b-instruct",
+
+    # Moonshot / MoonshotAI
+    "claude-nvidia-kimi-k2": "moonshotai/kimi-k2.6",
+
+    # Google Gemma
+    "claude-nvidia-gemma-4-31b": "google/gemma-4-31b-it",
+    "claude-nvidia-gemma-3-12b": "google/gemma-3-12b-it",
 }
 
 def _load_yaml_config() -> dict:
@@ -115,6 +150,11 @@ PING_INTERVAL = float(_STREAMING.get("ping_interval", 15.0))
 # Anthropic streams at ~sub-word granularity. NVIDIA emits 10–40-char chunks.
 # We resplit on word/punctuation boundaries to recreate the "typing" feel.
 TEXT_DELTA_CHARS = int(_STREAMING.get("text_delta_chars", 6))
+
+# Static ISO timestamp for /v1/models created_at — per-call datetime.now()
+# makes every response look like a different model version.
+from datetime import datetime, timezone as _tz
+_PROXY_START_ISO = datetime.now(_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def resolve_model(requested: str) -> str:
     """Resolve a Claude Code requested model to an upstream NVIDIA model."""
@@ -304,12 +344,35 @@ def translate_messages(
     return out
 
 
-def translate_tools(tools: list[dict] | None) -> list[dict] | None:
+_OPENAI_MAX_TOOL_NAME = 64  # OpenAI/NVIDIA hard limit; Anthropic allows 128
+
+
+def _safe_tool_name(name: str, tool_name_map: dict[str, str]) -> str:
+    """Truncate tool name to OpenAI's 64-char limit and record the mapping.
+
+    LiteLLM documents this as a critical correctness issue: NVIDIA silently
+    truncates longer names, so the response comes back with a different name
+    than the request, breaking Claude Code's tool call round-trip.
+    """
+    if len(name) <= _OPENAI_MAX_TOOL_NAME:
+        tool_name_map[name] = name
+        return name
+    short = name[:_OPENAI_MAX_TOOL_NAME]
+    tool_name_map[short] = name  # preserve original for response translation
+    return short
+
+
+def translate_tools(
+    tools: list[dict] | None,
+    tool_name_map: dict[str, str] | None = None,
+) -> list[dict] | None:
     if not tools:
         return None
+    if tool_name_map is None:
+        tool_name_map = {}
     out = []
     tool_count = len(tools)
-    
+
     # Aggressively cap descriptions if many tools are present to fit context
     desc_cap = 480
     if tool_count > 100:
@@ -321,7 +384,7 @@ def translate_tools(tools: list[dict] | None) -> list[dict] | None:
         # Skip Anthropic server-side tools — no NVIDIA equivalent
         if SERVER_TOOL_RE.search(t.get("type") or ""):
             continue
-            
+
         desc = t.get("description") or ""
         if len(desc) > desc_cap:
             desc = desc[:desc_cap] + "..."
@@ -329,7 +392,7 @@ def translate_tools(tools: list[dict] | None) -> list[dict] | None:
         out.append({
             "type": "function",
             "function": {
-                "name": t["name"],
+                "name": _safe_tool_name(t["name"], tool_name_map),
                 "description": desc,
                 "parameters": t.get("input_schema") or {
                     "type": "object", "properties": {}
@@ -356,7 +419,7 @@ def translate_tool_choice(tc):
     return "auto"
 
 
-def translate_request(body: dict, tool_id_map: dict[str, str]) -> dict:
+def translate_request(body: dict, tool_id_map: dict[str, str], tool_name_map: dict[str, str]) -> dict:
     msgs: list[dict] = []
     sys = flatten_system(body.get("system"))
 
@@ -372,10 +435,30 @@ def translate_request(body: dict, tool_id_map: dict[str, str]) -> dict:
 
     msgs.extend(translate_messages(body.get("messages") or [], tool_id_map))
 
-    # Clamp max_tokens to a safe default if missing or too high
-    max_tokens = body.get("max_tokens", 4096)
-    if max_tokens > 16384:
-        max_tokens = 16384
+    # Clamp max_tokens so input + output never exceed this model's context window.
+    # Uses per-model registry (LiteLLM pattern) so models with 202k+ windows are
+    # handled correctly instead of all being capped at a single global constant.
+    nvidia_model = resolve_model(body["model"])
+    ctx_limit = _context_limit_for(nvidia_model)
+
+    max_tokens = min(body.get("max_tokens") or 4096, 16384)
+
+    # Walk the full message tree to estimate input tokens — nested content blocks
+    # (tool_result, image, thinking) would be missed by a flat .get("content") call.
+    def _count_chars(obj) -> int:
+        if isinstance(obj, str):
+            return len(obj)
+        if isinstance(obj, list):
+            return sum(_count_chars(v) for v in obj)
+        if isinstance(obj, dict):
+            return sum(_count_chars(v) for k, v in obj.items()
+                       if k not in ("type", "media_type", "cache_control"))
+        return 0
+
+    estimated_input = _count_chars(msgs) // 4
+    headroom = ctx_limit - estimated_input - 128  # 128-token safety margin
+    if headroom < max_tokens:
+        max_tokens = max(1, headroom)
 
     payload: dict = {
         "model": resolve_model(body["model"]),
@@ -383,12 +466,12 @@ def translate_request(body: dict, tool_id_map: dict[str, str]) -> dict:
         "max_tokens": max_tokens,
         "stream": bool(body.get("stream", False)),
     }
-    for key in ("temperature", "top_p", "top_k"):
+    for key in ("temperature", "top_p"):
         if (v := body.get(key)) is not None:
             payload[key] = v
     if (ss := body.get("stop_sequences")) is not None:
         payload["stop"] = ss
-    if (tools := translate_tools(body.get("tools"))):
+    if (tools := translate_tools(body.get("tools"), tool_name_map)):
         payload["tools"] = tools
         if (tc := translate_tool_choice(body.get("tool_choice"))) is not None:
             payload["tool_choice"] = tc
@@ -423,7 +506,7 @@ def extract_thinking(content: str | None, reasoning: str | None) -> tuple[str | 
     return None, content or ""
 
 
-def translate_response(oai: dict, model: str, tool_id_map: dict[str, str]) -> dict:
+def translate_response(oai: dict, model: str, tool_id_map: dict[str, str], tool_name_map: dict[str, str] | None = None) -> dict:
     choice = (oai.get("choices") or [{}])[0]
     msg = choice.get("message") or {}
     blocks: list[dict] = []
@@ -449,10 +532,12 @@ def translate_response(oai: dict, model: str, tool_id_map: dict[str, str]) -> di
         oid = tc.get("id") or new_tool_id()
         anth_id = oid if oid.startswith("toolu_") else new_tool_id()
         tool_id_map[anth_id] = oid
+        truncated_name = fn.get("name", "")
+        original_name = (tool_name_map or {}).get(truncated_name, truncated_name)
         blocks.append({
             "type": "tool_use",
             "id": anth_id,
-            "name": fn.get("name", ""),
+            "name": original_name,
             "input": args,
         })
 
@@ -517,9 +602,10 @@ class StreamTranslator:
     modalities (text↔thinking↔tool_use) closes the previous block first.
     """
 
-    def __init__(self, model: str, tool_id_map: dict[str, str]):
+    def __init__(self, model: str, tool_id_map: dict[str, str], tool_name_map: dict[str, str] | None = None):
         self.model = model
         self.tool_id_map = tool_id_map
+        self.tool_name_map = tool_name_map or {}
         self.next_index = 0
         self.open_type: str | None = None  # "text" | "thinking" | "tool_use"
         self.open_index: int | None = None
@@ -683,13 +769,14 @@ class StreamTranslator:
                 self.open_type = "tool_use"
                 self.open_index = buf["anth_idx"]
                 buf["started"] = True
+                original_name = self.tool_name_map.get(buf["name"], buf["name"])
                 yield self._ev("content_block_start", {
                     "type": "content_block_start",
                     "index": buf["anth_idx"],
                     "content_block": {
                         "type": "tool_use",
                         "id": anth_id,
-                        "name": buf["name"],
+                        "name": original_name,
                         "input": {},
                     },
                 })
@@ -778,19 +865,81 @@ def _nvidia_error_message(body: dict | str) -> str:
     return str(body)[:500]
 
 
+# Matches NVIDIA's actual error format:
+# "maximum context length is 131072 tokens. However, you requested 16384 output
+#  tokens and your prompt contains at least 114689 input tokens"
 _CTX_OVERFLOW_RE = re.compile(
+    r"maximum context length is (\d+) tokens.*?"
+    r"requested (\d+) output tokens.*?"
+    r"contains at least (\d+) input tokens",
+    re.DOTALL,
+)
+
+# Fallback for other wording variations from older NIM versions.
+_CTX_OVERFLOW_RE2 = re.compile(
     r"passed (\d+) input tokens and requested (\d+).*?context length is only (\d+)",
     re.DOTALL,
 )
 
+# Per-model context window registry (same pattern as LiteLLM).
+# Values are total context length in tokens (input + output).
+# Keyed on the NVIDIA model ID as returned by /v1/models.
+# Unknown models fall back to FALLBACK_CONTEXT_LIMIT.
+FALLBACK_CONTEXT_LIMIT = 131072
+MODEL_CONTEXT_REGISTRY: dict[str, int] = {
+    # Nemotron
+    "nvidia/llama-3.3-nemotron-super-49b-v1.5":  131072,
+    "nvidia/llama-3.1-nemotron-ultra-253b-v1":   131072,
+    "nvidia/llama-3.1-nemotron-70b-instruct":    131072,
+    "nvidia/llama-3.1-nemotron-nano-8b-v1":      131072,
+    # Meta Llama 3.x
+    "meta/llama-3.3-70b-instruct":               131072,
+    "meta/llama-3.1-70b-instruct":               131072,
+    "meta/llama-3.1-8b-instruct":                131072,
+    "meta/llama-3.2-90b-vision-instruct":        131072,
+    "meta/llama-3.2-11b-vision-instruct":        131072,
+    "meta/llama-3.2-3b-instruct":                131072,
+    "meta/llama-3.2-1b-instruct":                131072,
+    "meta/llama-4-maverick-17b-128e-instruct":   524288,
+    # DeepSeek
+    "deepseek-ai/deepseek-v4-pro":               163840,
+    "deepseek-ai/deepseek-v4-flash":             163840,
+    # Mistral
+    "mistralai/mistral-large-2-instruct":        131072,
+    "mistralai/mistral-medium-3.5-128b":         131072,
+    "mistralai/mistral-large-3-675b-instruct-2512": 131072,
+    "mistralai/mixtral-8x22b-instruct-v0.1":     65536,
+    "mistralai/mixtral-8x7b-instruct-v0.1":      32768,
+    # Qwen
+    "qwen/qwen3-coder-480b-a35b-instruct":       131072,
+    "qwen/qwen3-next-80b-a3b-instruct":          131072,
+    "qwen/qwen3.5-122b-a10b":                    131072,
+    # Moonshot
+    "moonshotai/kimi-k2.6":                      131072,
+    # Google Gemma
+    "google/gemma-4-31b-it":                     131072,
+    "google/gemma-3-12b-it":                     131072,
+}
+
+
+def _context_limit_for(nvidia_model_id: str) -> int:
+    """Return the total context window size for a given NVIDIA model ID."""
+    return MODEL_CONTEXT_REGISTRY.get(nvidia_model_id, FALLBACK_CONTEXT_LIMIT)
+
+
 def _context_safe_max_tokens(err_msg: str) -> int | None:
     """Return a reduced max_tokens that fits inside the model context, or None."""
     m = _CTX_OVERFLOW_RE.search(err_msg)
-    if not m:
-        return None
-    input_toks, ctx = int(m.group(1)), int(m.group(3))
-    safe = ctx - input_toks - 1
-    return safe if safe > 0 else None
+    if m:
+        ctx, input_toks = int(m.group(1)), int(m.group(3))
+        safe = ctx - input_toks - 1
+        return safe if safe > 0 else None
+    m2 = _CTX_OVERFLOW_RE2.search(err_msg)
+    if m2:
+        input_toks, ctx = int(m2.group(1)), int(m2.group(3))
+        safe = ctx - input_toks - 1
+        return safe if safe > 0 else None
+    return None
 
 
 def check_auth(request: Request):
@@ -814,20 +963,61 @@ async def healthz():
 
 @app.get("/v1/models")
 async def list_models(request: Request):
-    """Proxy NVIDIA's /v1/models verbatim."""
+    """Return Anthropic-format model list.
+
+    Claude Code and Claude Desktop validate the schema strictly:
+    - each entry needs "type": "model" (not OpenAI's "object": "model")
+    - top-level needs has_more / first_id / last_id pagination fields
+    - created_at must be an ISO-8601 string, not a Unix timestamp
+
+    We surface the proxy's Claude aliases first (so the model picker shows
+    familiar claude-* names), followed by every real NVIDIA model from the
+    upstream catalog.
+    """
     auth = check_auth(request)
     if auth is not None:
         return auth
+
     nvidia: httpx.AsyncClient = request.app.state.nvidia
     try:
         r = await nvidia.get("/models")
         try:
-            data = r.json()
+            nvidia_data = r.json().get("data", [])
         except Exception:
-            data = {"object": "list", "data": []}
-        return JSONResp(data, status_code=r.status_code)
-    except httpx.HTTPError as e:
-        return JSONResp({"type": "error", "error": {"type": "api_error", "message": str(e)[:500]}}, status_code=502)
+            nvidia_data = []
+    except httpx.HTTPError:
+        nvidia_data = []
+
+    def _to_anthropic(model_id: str, display: str | None = None) -> dict:
+        return {
+            "type": "model",
+            "id": model_id,
+            "display_name": display or model_id,
+            "created_at": _PROXY_START_ISO,
+        }
+
+    # Claude alias entries come first — these are what Claude Code's model
+    # picker sends, and the proxy knows how to resolve them.
+    seen: set[str] = set()
+    models = []
+    for alias in MODEL_ALIASES:
+        if alias not in seen:
+            models.append(_to_anthropic(alias))
+            seen.add(alias)
+
+    # Append real NVIDIA catalog models in Anthropic format.
+    for m in nvidia_data:
+        mid = m.get("id", "")
+        if mid and mid not in seen:
+            models.append(_to_anthropic(mid))
+            seen.add(mid)
+
+    return JSONResp({
+        "data": models,
+        "has_more": False,
+        "first_id": models[0]["id"] if models else None,
+        "last_id": models[-1]["id"] if models else None,
+    })
 
 
 @app.post("/v1/messages/count_tokens")
@@ -869,7 +1059,8 @@ async def messages(request: Request):
         )
 
     tool_id_map: dict[str, str] = {}
-    payload = translate_request(body, tool_id_map)
+    tool_name_map: dict[str, str] = {}
+    payload = translate_request(body, tool_id_map, tool_name_map)
     nvidia: httpx.AsyncClient = request.app.state.nvidia
 
     # Non-streaming path
@@ -895,7 +1086,7 @@ async def messages(request: Request):
                     try:
                         resp = await nvidia.post("/chat/completions", json=payload)
                         if resp.status_code < 400:
-                            return JSONResp(translate_response(resp.json(), body["model"], tool_id_map))
+                            return JSONResp(translate_response(resp.json(), body["model"], tool_id_map, tool_name_map))
                         body_err = _nvidia_error_message(resp.json())
                     except httpx.HTTPError:
                         pass
@@ -905,11 +1096,11 @@ async def messages(request: Request):
                            "message": body_err}},
                 status_code=resp.status_code,
             )
-        return JSONResp(translate_response(resp.json(), body["model"], tool_id_map))
+        return JSONResp(translate_response(resp.json(), body["model"], tool_id_map, tool_name_map))
 
     # Streaming path
     return StreamingResponse(
-        stream_response(request, body, payload, tool_id_map),
+        stream_response(request, body, payload, tool_id_map, tool_name_map),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache, no-transform",
@@ -921,7 +1112,8 @@ async def messages(request: Request):
 
 
 async def stream_response(
-    request: Request, body: dict, payload: dict, tool_id_map: dict[str, str]
+    request: Request, body: dict, payload: dict, tool_id_map: dict[str, str],
+    tool_name_map: dict[str, str] | None = None,
 ) -> AsyncIterator[bytes]:
     """The hot path. Three things to remember:
     1. Emit message_start IMMEDIATELY — don't wait for NVIDIA's first chunk.
@@ -950,7 +1142,7 @@ async def stream_response(
         },
     })
 
-    st = StreamTranslator(model=model, tool_id_map=tool_id_map)
+    st = StreamTranslator(model=model, tool_id_map=tool_id_map, tool_name_map=tool_name_map or {})
     payload = {
         **payload,
         "stream": True,
