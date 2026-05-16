@@ -9,6 +9,23 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.2.5] — 2026-05-16
+
+### Fixed
+- **Streaming tool call parse failure** ("The model's tool call could not be parsed"):
+  NVIDIA's first streaming chunk for a tool call always has `"arguments": null`; if a
+  second chunk with real args never arrives (no-arg tool, model quirk, or network race),
+  `StreamTranslator` emitted zero `input_json_delta` events. Claude Code then called
+  `JSON.parse("")` → threw → showed the parse-error dialog. Fixed by tracking whether
+  any args delta was emitted per tool block and injecting a single `{}` fallback in
+  `_close_open()` before `content_block_stop` when args were never sent.
+- **Dict arguments guard**: NVIDIA could theoretically send `function.arguments` as a
+  pre-parsed JSON object (dict) instead of a JSON string, violating the OpenAI streaming
+  spec. Added `isinstance(args, dict)` check with automatic `json.dumps()` conversion so
+  `partial_json` is always a string.
+
+---
+
 ## [0.2.4] — 2026-05-16
 
 ### Fixed

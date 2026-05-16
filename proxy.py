@@ -733,6 +733,26 @@ class StreamTranslator:
                 },
             )
             self.signature_sent = True
+        if self.open_type == "tool_use":
+            # Guarantee at least one input_json_delta so Claude Code's
+            # JSON.parse() has something to work with (NVIDIA's first chunk
+            # often has arguments=null; if no args chunk ever arrived we must
+            # emit '{}' to avoid an empty-accumulation parse failure).
+            for buf in self.tools.values():
+                if buf.get("anth_idx") == self.open_index and buf.get("started"):
+                    if not buf.get("args_emitted"):
+                        yield self._ev(
+                            "content_block_delta",
+                            {
+                                "type": "content_block_delta",
+                                "index": self.open_index,
+                                "delta": {
+                                    "type": "input_json_delta",
+                                    "partial_json": "{}",
+                                },
+                            },
+                        )
+                    break
         yield self._ev(
             "content_block_stop",
             {
@@ -867,6 +887,7 @@ class StreamTranslator:
                     "started": False,
                     "anth_id": None,
                     "anth_idx": None,
+                    "args_emitted": False,
                 },
             )
             fn = tc.get("function") or {}
@@ -875,6 +896,9 @@ class StreamTranslator:
             if n := fn.get("name"):
                 buf["name"] = n
             args = fn.get("arguments")
+            # NVIDIA sometimes sends arguments as a pre-parsed dict; normalise to string.
+            if isinstance(args, dict):
+                args = json.dumps(args)
 
             if not buf["started"] and buf["oid"] and buf["name"]:
                 yield from self._close_open()
@@ -903,6 +927,7 @@ class StreamTranslator:
                     },
                 )
             if buf["started"] and args:
+                buf["args_emitted"] = True
                 yield self._ev(
                     "content_block_delta",
                     {
