@@ -1,0 +1,25 @@
+name = "nim-proxy"
+main = "src/index.ts"
+compatibility_date = "2026-05-16"
+
+[observability]
+enabled = true
+
+[placement]
+mode = "smart"
+
+[[containers]]
+class_name = "NimProxyContainer"
+image = "../Dockerfile"
+max_instances = 3
+instance_type = "standard"
+rollout_step_percentage = 25
+rollout_kind = "full_auto"
+
+[[durable_objects.bindings]]
+name = "NIM_PROXY"
+class_name = "NimProxyContainer"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["NimProxyContainer"]

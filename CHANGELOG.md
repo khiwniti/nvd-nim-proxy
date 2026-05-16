@@ -9,6 +9,29 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.2.4] — 2026-05-16
+
+### Fixed
+- **Context-overflow root cause**: tool definitions (60+ schemas Claude Code sends)
+  were not counted in the pre-flight token estimate, causing systematic 400 errors
+  on large sessions. `translate_request` now pre-translates tools and includes them
+  in `_count_chars` before clamping `max_tokens`.
+- **Retry resilience**: NVIDIA's `"at least N input tokens"` in overflow errors is
+  a lower bound, not an exact count. Streaming path retries raised from 2 → 3
+  attempts; non-streaming from 1 → 2 retries. Each successive attempt adds
+  `attempt × 4096` extra margin to absorb the undercount.
+- `CONTEXT_SAFETY_MARGIN` default raised from 2 048 → **4 096** tokens so that
+  normal tokenizer drift no longer reaches NVIDIA before the proxy catches it.
+
+### Added
+- `MAX_REQUEST_BODY` limit (default 10 MB) — rejects oversized payloads with 413
+  before JSON parsing to prevent memory pressure.
+- Cloudflare `wrangler.toml` hardening: `[observability]`, `[placement] mode = "smart"`,
+  `instance_type = "standard"`, 25 % gradual rollout (`rollout_kind = "full_auto"`).
+- Second "Deploy to Cloudflare" button inside the Deploy section of `README.md`.
+
+---
+
 ## [0.2.3] — 2026-05-16
 
 ### Added

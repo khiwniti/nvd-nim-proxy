@@ -9,7 +9,9 @@
 [![PyPI](https://img.shields.io/badge/pypi-nim--claude--proxy-orange?logo=pypi&logoColor=white)](https://pypi.org/project/nim-claude-proxy)
 [![Tests](https://img.shields.io/badge/tests-27%20passing-brightgreen)](tests/)
 
-<a href="https://deploy.workers.cloudflare.com/?url=https://github.com/khiwniti/nvd-nim-proxy"><img src="https://deploy.workers.cloudflare.com/button" alt="Deploy to Cloudflare"/></a>
+<a href="https://deploy.workers.cloudflare.com/?url=https://github.com/khiwniti/nvd-nim-proxy">
+  <img src="https://deploy.workers.cloudflare.com/button" alt="Deploy to Cloudflare" height="36"/>
+</a>
 
 ```
 Claude Code ──/v1/messages──► nvd-nim-proxy ──/v1/chat/completions──► integrate.api.nvidia.com
@@ -64,9 +66,13 @@ NVIDIA_API_KEY=nvapi-... nim code
 
 ## Deploy on Cloudflare
 
+<a href="https://deploy.workers.cloudflare.com/?url=https://github.com/khiwniti/nvd-nim-proxy">
+  <img src="https://deploy.workers.cloudflare.com/button" alt="Deploy to Cloudflare" height="36"/>
+</a>
+
 This repository includes a Cloudflare Workers + Containers configuration at the repository root (`wrangler.toml`) and a Worker entrypoint in `worker/src/index.ts`. The Worker runs the Python FastAPI proxy inside a Cloudflare Container and forwards `/v1/messages`, `/v1/models`, and `/v1/messages/count_tokens` to it.
 
-**One-click:** use the **Deploy to Cloudflare** button above, then set the required secret in the created Worker project:
+**One-click:** click the button above, then set the required secret in the created Worker project:
 
 ```bash
 npx wrangler secret put NVIDIA_API_KEY

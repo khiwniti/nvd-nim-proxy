@@ -157,8 +157,11 @@ MAX_OUTPUT_TOKENS = int(
 )
 CONTEXT_SAFETY_MARGIN = int(
     os.environ.get("CONTEXT_SAFETY_MARGIN")
-    or _CONTEXT.get("safety_margin_tokens", 2048)
+    or _CONTEXT.get("safety_margin_tokens", 4096)
 )
+MAX_REQUEST_BODY = int(
+    os.environ.get("MAX_REQUEST_BODY_BYTES") or 10 * 1024 * 1024
+)  # 10 MB default
 
 # Static ISO timestamp for /v1/models created_at — per-call datetime.now()
 # makes every response look like a different model version.
@@ -465,8 +468,13 @@ def translate_request(
     msgs: list[dict] = []
     sys = flatten_system(body.get("system"))
 
+    # Pre-translate tools before building msgs so we can count their tokens.
+    # Claude Code sends 60+ tool definitions; omitting them from the estimate
+    # is the primary cause of context-overflow errors.
+    translated_tools = translate_tools(body.get("tools"), tool_name_map)
+
     # Inject tool protocol if tools are present
-    if body.get("tools"):
+    if translated_tools:
         if sys:
             sys = _TOOL_PROTOCOL_SYSTEM_PROMPT.strip() + "\n\n" + sys
         else:
@@ -500,7 +508,8 @@ def translate_request(
             )
         return 0
 
-    estimated_input = _count_chars(msgs) // 4
+    # Include both messages AND translated tool definitions in the estimate.
+    estimated_input = (_count_chars(msgs) + _count_chars(translated_tools or [])) // 4
     headroom = ctx_limit - estimated_input - CONTEXT_SAFETY_MARGIN
     if headroom < max_tokens:
         max_tokens = max(1, headroom)
@@ -516,8 +525,8 @@ def translate_request(
             payload[key] = v
     if (ss := body.get("stop_sequences")) is not None:
         payload["stop"] = ss
-    if tools := translate_tools(body.get("tools"), tool_name_map):
-        payload["tools"] = tools
+    if translated_tools:
+        payload["tools"] = translated_tools
         if (tc := translate_tool_choice(body.get("tool_choice"))) is not None:
             payload["tool_choice"] = tc
     # Forward Claude Code's metadata.user_id as OpenAI's `user`
@@ -1031,17 +1040,23 @@ def _context_limit_for(nvidia_model_id: str) -> int:
     return MODEL_CONTEXT_REGISTRY.get(nvidia_model_id, FALLBACK_CONTEXT_LIMIT)
 
 
-def _context_safe_max_tokens(err_msg: str) -> int | None:
-    """Return a reduced max_tokens that fits inside the model context, or None."""
+def _context_safe_max_tokens(err_msg: str, extra_margin: int = 0) -> int | None:
+    """Return a reduced max_tokens that fits inside the model context, or None.
+
+    extra_margin adds to the safety buffer on successive retries — needed because
+    NVIDIA's "at least N input tokens" is a lower bound, not the exact count.
+    Passing attempt * 4096 as extra_margin gives progressively safer values.
+    """
+    total_margin = max(CONTEXT_SAFETY_MARGIN, 1) + extra_margin
     m = _CTX_OVERFLOW_RE.search(err_msg)
     if m:
         ctx, input_toks = int(m.group(1)), int(m.group(3))
-        safe = ctx - input_toks - max(CONTEXT_SAFETY_MARGIN, 1)
+        safe = ctx - input_toks - total_margin
         return min(safe, MAX_OUTPUT_TOKENS) if safe > 0 else None
     m2 = _CTX_OVERFLOW_RE2.search(err_msg)
     if m2:
         input_toks, ctx = int(m2.group(1)), int(m2.group(3))
-        safe = ctx - input_toks - max(CONTEXT_SAFETY_MARGIN, 1)
+        safe = ctx - input_toks - total_margin
         return min(safe, MAX_OUTPUT_TOKENS) if safe > 0 else None
     return None
 
@@ -1159,6 +1174,18 @@ async def messages(request: Request):
     auth = check_auth(request)
     if auth is not None:
         return auth
+    cl = request.headers.get("content-length")
+    if cl and int(cl) > MAX_REQUEST_BODY:
+        return JSONResp(
+            {
+                "type": "error",
+                "error": {
+                    "type": "request_too_large",
+                    "message": f"Request body exceeds {MAX_REQUEST_BODY // (1024 * 1024)} MB limit",
+                },
+            },
+            status_code=413,
+        )
     try:
         body = await request.json()
     except Exception as e:
@@ -1203,10 +1230,14 @@ async def messages(request: Request):
                 body_err = _nvidia_error_message(resp.json())
             except Exception:
                 body_err = resp.text[:500]
-            # Auto-retry once with reduced max_tokens on context-length overflow
+            # Auto-retry up to 2× on context-length overflow, each time with an
+            # escalating extra margin — NVIDIA's "at least N tokens" undercount
+            # can cause even a corrected max_tokens to overflow on the first retry.
             if resp.status_code == 400:
-                safe = _context_safe_max_tokens(body_err)
-                if safe is not None:
+                for retry_n in range(2):
+                    safe = _context_safe_max_tokens(body_err, extra_margin=retry_n * 4096)
+                    if safe is None:
+                        break
                     payload["max_tokens"] = safe
                     try:
                         resp = await nvidia.post("/chat/completions", json=payload)
@@ -1221,7 +1252,7 @@ async def messages(request: Request):
                             )
                         body_err = _nvidia_error_message(resp.json())
                     except httpx.HTTPError:
-                        pass
+                        break
             return JSONResp(
                 {
                     "type": "error",
@@ -1305,7 +1336,7 @@ async def stream_response(
 
     async def producer():
         try:
-            for attempt in range(2):
+            for attempt in range(3):
                 async with nvidia.stream(
                     "POST", "/chat/completions", json=payload
                 ) as r:
@@ -1315,10 +1346,13 @@ async def stream_response(
                             err_body = json.loads(body_bytes)
                         except Exception:
                             err_body = body_bytes.decode(errors="replace")
-                        # Auto-retry once on context-length overflow
-                        if r.status_code == 400 and attempt == 0:
+                        # Auto-retry up to 2× on context-length overflow.
+                        # Extra margin escalates per attempt because NVIDIA's
+                        # "at least N tokens" is a lower bound, not exact.
+                        if r.status_code == 400 and attempt < 2:
                             safe = _context_safe_max_tokens(
-                                _nvidia_error_message(err_body)
+                                _nvidia_error_message(err_body),
+                                extra_margin=attempt * 4096,
                             )
                             if safe is not None:
                                 payload["max_tokens"] = safe

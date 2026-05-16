@@ -2,11 +2,28 @@ name = "nvd-nim-proxy"
 main = "worker/src/index.ts"
 compatibility_date = "2026-05-16"
 
+# Observability: Worker logs visible in Cloudflare dashboard → Workers → Logs
+[observability]
+enabled = true
+
+# Smart placement: Cloudflare routes requests to the datacenter nearest to the
+# NVIDIA NIM API endpoint (US-East), reducing round-trip latency.
+[placement]
+mode = "smart"
+
 [[containers]]
 class_name = "NimProxyContainer"
 image = "./Dockerfile"
+# Limit to 3 hot instances; each sleeps after 30 min idle (see index.ts).
 max_instances = 3
-instance_type = "basic"
+# "standard" gives 1 vCPU / 512 MB RAM vs "basic" 0.5 vCPU / 256 MB.
+# The Python proxy is I/O-bound but benefits from the extra memory headroom
+# when handling large tool-call payloads from Claude Code.
+instance_type = "standard"
+# Gradual rollout: shift 25 % of traffic per step so a bad deploy doesn't
+# immediately affect all users.
+rollout_step_percentage = 25
+rollout_kind = "full_auto"
 
 [[durable_objects.bindings]]
 name = "NIM_PROXY"
