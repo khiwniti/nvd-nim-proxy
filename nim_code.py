@@ -187,7 +187,13 @@ def start_daemon(config: dict) -> tuple[bool, str]:
         return True, f"already:{pid}:{url}"
 
     port = get_proxy_port(config)
+    url = get_proxy_url(config)
     if is_port_in_use(port):
+        # The PID file may be missing/stale while a previous proxy is still
+        # healthy on the configured port (common after shell/tmux restarts).
+        # Reuse it instead of failing with an unactionable "port in use" error.
+        if wait_for_proxy(url, timeout=2):
+            return True, f"already:unknown:{url}"
         return False, f"port:{port}"
 
     proxy_py = Path(__file__).parent / "proxy.py"
@@ -204,7 +210,6 @@ def start_daemon(config: dict) -> tuple[bool, str]:
         )
 
     write_pid(proc.pid)
-    url = get_proxy_url(config)
 
     if wait_for_proxy(url, timeout=15):
         return True, f"started:{proc.pid}:{url}"
@@ -955,7 +960,13 @@ def cmd_code(args: argparse.Namespace) -> None:
             ok, msg = start_daemon(config)
         if not ok:
             if msg.startswith("port:"):
-                console.print(f"[red]✗[/red] Port {msg.split(':')[1]} already in use.")
+                port = msg.split(":")[1]
+                console.print(
+                    f"[red]✗[/red] Port {port} already in use by a non-proxy process."
+                )
+                console.print(
+                    f"  [dim]Fix:[/dim] run [white]nim configure server.port <free-port>[/white] or stop the process using port {port}."
+                )
             else:
                 console.print(f"[red]✗[/red] {msg}")
             sys.exit(1)
@@ -976,6 +987,7 @@ def cmd_code(args: argparse.Namespace) -> None:
     env = os.environ.copy()
     env["ANTHROPIC_BASE_URL"] = url
     env["ANTHROPIC_API_KEY"] = env.get("ANTHROPIC_API_KEY", "not-used")
+    env["ANTHROPIC_MODEL"] = model
     env["ANTHROPIC_CUSTOM_MODEL_OPTION"] = model
     env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = haiku_model
     env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = opus_model

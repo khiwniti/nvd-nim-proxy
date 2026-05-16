@@ -9,6 +9,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.2.2] — 2026-05-16
+
+### Fixed
+- `nim code --model ...` and interactive model selection now set
+  `ANTHROPIC_MODEL` in addition to picker/default model variables, so Claude
+  Code immediately starts with the selected NVIDIA model instead of showing the
+  configured default.
+
+---
+
 ## [0.2.1] — 2026-05-16
 
 ### Added
