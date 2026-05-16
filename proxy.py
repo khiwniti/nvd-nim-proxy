@@ -684,6 +684,82 @@ def _safe_suffix_len(buf: str, target: str) -> int:
     return 0
 
 
+def _validate_or_repair_tool_args(raw: str) -> str:
+    """Validate or repair a streamed tool-call argument JSON string.
+
+    Claude Code's streaming consumer calls ``JSON.parse(accumulated_partial_json)``
+    once it sees ``content_block_stop``. If the accumulated string is empty or
+    malformed, the TUI throws "The model's tool call could not be parsed".
+
+    NVIDIA's two observed failure modes:
+      1. No arg chunks ever sent (first chunk has ``arguments: null``, no
+         follow-up) → empty string.
+      2. Stream truncated mid-write → unclosed quote and/or unclosed
+         ``{``/``[``.
+
+    Strategy (per user decision, 2026-05-16): best-effort auto-repair.
+      • Empty/whitespace → ``"{}"`` (well-formed empty object).
+      • Already valid → return as-is (trimmed).
+      • Else: close any open string, then close braces/brackets in stack
+        order, then re-parse.
+      • If repair still fails → ``"{}"`` as safe fallback.
+
+    The function never raises; it always returns a string that ``json.loads``
+    can parse.
+    """
+    if not raw or not raw.strip():
+        return "{}"
+
+    s = raw.strip()
+
+    # Fast path: already valid JSON.
+    try:
+        json.loads(s)
+        return s
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # Repair pass: walk the string, tracking string state and bracket stack.
+    # Mirrors the structural skeleton; doesn't try to fix malformed numbers
+    # or trailing commas (which JSON.parse also rejects but NVIDIA doesn't
+    # tend to emit).
+    stack: list[str] = []
+    in_string = False
+    escape = False
+    for ch in s:
+        if escape:
+            escape = False
+            continue
+        if ch == "\\" and in_string:
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "{":
+            stack.append("}")
+        elif ch == "[":
+            stack.append("]")
+        elif ch in ("}", "]") and stack and stack[-1] == ch:
+            stack.pop()
+
+    repaired = s
+    if in_string:
+        repaired += '"'
+    # Close in LIFO order to mirror the open order.
+    while stack:
+        repaired += stack.pop()
+
+    try:
+        json.loads(repaired)
+        return repaired
+    except (json.JSONDecodeError, ValueError):
+        # Give up: emit a parseable empty object so the consumer survives.
+        return "{}"
+
+
 class StreamTranslator:
     """OpenAI streaming chunks → Anthropic SSE events.
 
@@ -734,24 +810,26 @@ class StreamTranslator:
             )
             self.signature_sent = True
         if self.open_type == "tool_use":
-            # Guarantee at least one input_json_delta so Claude Code's
-            # JSON.parse() has something to work with (NVIDIA's first chunk
-            # often has arguments=null; if no args chunk ever arrived we must
-            # emit '{}' to avoid an empty-accumulation parse failure).
+            # Buffer-and-validate: emit a single atomic input_json_delta whose
+            # contents are guaranteed parseable. Claude Code calls JSON.parse()
+            # on the concatenated stream; emitting one validated chunk removes
+            # every class of parse failure (null first chunk, mid-stream
+            # truncation at max_tokens, malformed dict-repr, network drop).
             for buf in self.tools.values():
                 if buf.get("anth_idx") == self.open_index and buf.get("started"):
-                    if not buf.get("args_emitted"):
-                        yield self._ev(
-                            "content_block_delta",
-                            {
-                                "type": "content_block_delta",
-                                "index": self.open_index,
-                                "delta": {
-                                    "type": "input_json_delta",
-                                    "partial_json": "{}",
-                                },
+                    raw = buf.get("args_buf", "") or ""
+                    validated = _validate_or_repair_tool_args(raw)
+                    yield self._ev(
+                        "content_block_delta",
+                        {
+                            "type": "content_block_delta",
+                            "index": self.open_index,
+                            "delta": {
+                                "type": "input_json_delta",
+                                "partial_json": validated,
                             },
-                        )
+                        },
+                    )
                     break
         yield self._ev(
             "content_block_stop",
@@ -887,7 +965,7 @@ class StreamTranslator:
                     "started": False,
                     "anth_id": None,
                     "anth_idx": None,
-                    "args_emitted": False,
+                    "args_buf": "",
                 },
             )
             fn = tc.get("function") or {}
@@ -927,18 +1005,8 @@ class StreamTranslator:
                     },
                 )
             if buf["started"] and args:
-                buf["args_emitted"] = True
-                yield self._ev(
-                    "content_block_delta",
-                    {
-                        "type": "content_block_delta",
-                        "index": buf["anth_idx"],
-                        "delta": {
-                            "type": "input_json_delta",
-                            "partial_json": args,
-                        },
-                    },
-                )
+                # Buffer args; emit once at block close after validation.
+                buf["args_buf"] = (buf.get("args_buf") or "") + args
 
         if finish:
             if self.text_buf:

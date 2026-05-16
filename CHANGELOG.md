@@ -9,6 +9,25 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.2.6] — 2026-05-16
+
+### Fixed
+- **Streaming tool call parse failures — permanent buffer-and-validate**: 0.2.5
+  added a `{}` fallback when zero arg chunks were emitted, but mid-stream
+  truncation (max_tokens cap, network drop, model quirk leaving an unclosed
+  quote or brace) still produced unparseable `partial_json` at
+  `content_block_stop`. `StreamTranslator` now buffers all `function.arguments`
+  fragments per tool block, then emits **one atomic `input_json_delta`** at
+  block close whose contents are guaranteed parseable by `JSON.parse()`.
+- **`_validate_or_repair_tool_args()`** auto-repair: empty/whitespace becomes
+  `{}`; valid JSON passes through; truncated JSON gets its open string closed
+  and brackets/braces re-balanced in LIFO order before a re-parse; if repair
+  still fails the helper returns `{}` as a safe fallback. Trades fine-grained
+  delta streaming for correctness — the trade is invisible to Claude Code,
+  which only parses at `content_block_stop`.
+
+---
+
 ## [0.2.5] — 2026-05-16
 
 ### Fixed
