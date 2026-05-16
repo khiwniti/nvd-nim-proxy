@@ -9,6 +9,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.2.3] — 2026-05-16
+
+### Added
+- `nim kill [--port PORT]` command to free the proxy port by terminating the
+  process currently listening on it.
+
+### Changed
+- Port-in-use errors now suggest `nim kill --port <port>` as the direct fix.
+
+---
+
 ## [0.2.2] — 2026-05-16
 
 ### Fixed

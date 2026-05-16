@@ -7,6 +7,7 @@ import argparse
 import copy
 import json
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -162,6 +163,83 @@ def is_port_in_use(port: int) -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.settimeout(0.5)
         return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+def pids_on_port(port: int) -> list[int]:
+    """Return process IDs listening on a local TCP port.
+
+    Uses common platform tools instead of adding a runtime dependency. `lsof`
+    works on macOS/Linux; `fuser` is a Linux fallback.
+    """
+    pids: set[int] = set()
+    if shutil.which("lsof"):
+        try:
+            out = subprocess.check_output(
+                ["lsof", "-nP", "-ti", f"TCP:{port}", "-sTCP:LISTEN"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            )
+            for line in out.splitlines():
+                if line.strip().isdigit():
+                    pids.add(int(line.strip()))
+        except subprocess.CalledProcessError:
+            pass
+    if not pids and shutil.which("fuser"):
+        try:
+            out = subprocess.check_output(
+                ["fuser", f"{port}/tcp"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            )
+            for part in out.split():
+                if part.strip().isdigit():
+                    pids.add(int(part.strip()))
+        except subprocess.CalledProcessError:
+            pass
+    return sorted(pids)
+
+
+def kill_pids(pids: list[int], timeout: float = 3.0) -> tuple[list[int], list[int]]:
+    """Terminate PIDs, escalating to SIGKILL after timeout.
+
+    Returns (stopped, failed). Never kills the current CLI process.
+    """
+    current = os.getpid()
+    targets = [pid for pid in pids if pid > 0 and pid != current]
+    stopped: list[int] = []
+    failed: list[int] = []
+    for pid in targets:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            stopped.append(pid)
+        except OSError:
+            failed.append(pid)
+
+    deadline = time.time() + timeout
+    remaining = [pid for pid in targets if pid not in stopped and pid not in failed]
+    while remaining and time.time() < deadline:
+        time.sleep(0.1)
+        next_remaining: list[int] = []
+        for pid in remaining:
+            try:
+                os.kill(pid, 0)
+                next_remaining.append(pid)
+            except ProcessLookupError:
+                stopped.append(pid)
+            except OSError:
+                failed.append(pid)
+        remaining = next_remaining
+
+    for pid in remaining:
+        try:
+            os.kill(pid, signal.SIGKILL)
+            stopped.append(pid)
+        except ProcessLookupError:
+            stopped.append(pid)
+        except OSError:
+            failed.append(pid)
+    return sorted(set(stopped)), sorted(set(failed))
 
 
 # ─── Proxy lifecycle ─────────────────────────────────────────────────────────
@@ -325,7 +403,7 @@ def cmd_start(args: argparse.Namespace) -> None:
             f"\n[red]✗[/red] Port [bold]{port}[/bold] is already in use by another process."
         )
         console.print(
-            f"  [dim]Fix:[/dim] change [cyan]server.port[/cyan] with [white]nim configure server.port <port>[/white]"
+            f"  [dim]Fix:[/dim] run [white]nim kill --port {port}[/white] to stop the blocker, or change [cyan]server.port[/cyan] with [white]nim configure server.port <port>[/white]."
         )
         console.print()
         sys.exit(1)
@@ -356,6 +434,40 @@ def cmd_stop(args: argparse.Namespace) -> None:
     else:
         console.print(f"\n[red]✗[/red] {msg}\n")
         sys.exit(1)
+
+
+def cmd_kill(args: argparse.Namespace) -> None:
+    """Kill whichever process is listening on the configured or requested port."""
+    config = load_config()
+    port = int(getattr(args, "port", None) or get_proxy_port(config))
+    pids = pids_on_port(port)
+    if not pids:
+        console.print(f"\n[dim]● No process is listening on port {port}.[/dim]\n")
+        return
+
+    console.print(
+        f"\n[yellow]⚠[/yellow] Killing process(es) on port [bold]{port}[/bold]: "
+        + ", ".join(str(pid) for pid in pids)
+    )
+    stopped, failed = kill_pids(pids)
+    saved_pid = read_pid()
+    if saved_pid and saved_pid in pids:
+        remove_pid()
+
+    if stopped:
+        console.print(
+            "[green]●[/green] Stopped PID(s): " + ", ".join(str(pid) for pid in stopped)
+        )
+    if failed:
+        console.print(
+            "[red]✗[/red] Could not stop PID(s): "
+            + ", ".join(str(pid) for pid in failed)
+        )
+        console.print(
+            "  [dim]You may need elevated permissions or to stop it manually.[/dim]\n"
+        )
+        sys.exit(1)
+    console.print(f"[green]✓[/green] Port {port} is free.\n")
 
 
 def cmd_restart(args: argparse.Namespace) -> None:
@@ -965,7 +1077,7 @@ def cmd_code(args: argparse.Namespace) -> None:
                     f"[red]✗[/red] Port {port} already in use by a non-proxy process."
                 )
                 console.print(
-                    f"  [dim]Fix:[/dim] run [white]nim configure server.port <free-port>[/white] or stop the process using port {port}."
+                    f"  [dim]Fix:[/dim] run [white]nim kill --port {port}[/white], or run [white]nim configure server.port <free-port>[/white]."
                 )
             else:
                 console.print(f"[red]✗[/red] {msg}")
@@ -1056,6 +1168,10 @@ def main() -> None:
 
     sub.add_parser("start", help="Start proxy as background daemon")
     sub.add_parser("stop", help="Stop running daemon")
+    kill_p = sub.add_parser("kill", help="Kill the process listening on the proxy port")
+    kill_p.add_argument(
+        "--port", type=int, help="Port to free (defaults to effective proxy port)"
+    )
     sub.add_parser("restart", help="Restart daemon")
 
     logs_p = sub.add_parser("logs", help="Show proxy logs")
@@ -1107,6 +1223,7 @@ def main() -> None:
         "use": cmd_use,
         "start": cmd_start,
         "stop": cmd_stop,
+        "kill": cmd_kill,
         "restart": cmd_restart,
         "logs": cmd_logs,
         "status": cmd_status,
