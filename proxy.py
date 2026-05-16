@@ -208,6 +208,30 @@ async def lifespan(app: FastAPI):
             "User-Agent": f"nvd-claude-proxy/1.0 (h2={int(http2)})",
         },
     )
+    # Pre-flight: probe unique alias targets with a minimal request to detect
+    # account-level access denials before users encounter opaque errors.
+    blocked: set[str] = set()
+    targets = set(MODEL_ALIASES.values())
+    for target in targets:
+        try:
+            r = await app.state.nvidia.post(
+                "/chat/completions",
+                json={"model": target, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1},
+                timeout=8.0,
+            )
+            if r.status_code == 404:
+                raw = ""
+                try:
+                    raw = r.json().get("error", {}).get("message", "")
+                except Exception:
+                    pass
+                if _NVIDIA_ACCOUNT_ACCESS_RE.search(raw):
+                    blocked.add(target)
+        except Exception:
+            pass
+    app.state.blocked_models = blocked
+    if blocked:
+        print(f"  blocked models (account access) → {', '.join(sorted(blocked))}")
     print(f"nvd-claude-proxy ready (HTTP/2={http2}) → {NVIDIA_BASE_URL}")
     yield
     await app.state.nvidia.aclose()
@@ -977,6 +1001,26 @@ def _nvidia_error_message(body: dict[str, Any] | str | bytes | bytearray) -> str
     return str(body)[:500]
 
 
+# Matches NVIDIA's account-level model access denial:
+# "Function 'UUID': Not found for account 'T-F7R-...'"
+# The model exists in the catalog but this API key's tier can't access it.
+_NVIDIA_ACCOUNT_ACCESS_RE = re.compile(
+    r"Function\s+'[\w-]+'\s*:\s*Not found for account",
+    re.IGNORECASE,
+)
+
+
+def _reformat_nvidia_error(raw_msg: str, nvidia_model: str) -> str:
+    """Return a human-readable error, replacing NVIDIA's opaque internal messages."""
+    if _NVIDIA_ACCOUNT_ACCESS_RE.search(raw_msg):
+        return (
+            f"Model '{nvidia_model}' is not available on your NVIDIA account "
+            f"(access not granted — may require a higher tier or specific credits). "
+            f"Run /model to choose a different model."
+        )
+    return raw_msg
+
+
 # Matches NVIDIA's actual error format:
 # "maximum context length is 131072 tokens. However, you requested 16384 output
 #  tokens and your prompt contains at least 114689 input tokens"
@@ -1124,17 +1168,20 @@ async def list_models(request: Request):
 
     # Claude alias entries come first — these are what Claude Code's model
     # picker sends, and the proxy knows how to resolve them.
+    # Skip aliases whose NVIDIA targets are blocked (account-level access denial).
+    blocked: set[str] = getattr(request.app.state, "blocked_models", set())
     seen: set[str] = set()
     models = []
-    for alias in MODEL_ALIASES:
-        if alias not in seen:
-            models.append(_to_anthropic(alias))
-            seen.add(alias)
+    for alias, target in MODEL_ALIASES.items():
+        if alias in seen or target in blocked:
+            continue
+        models.append(_to_anthropic(alias))
+        seen.add(alias)
 
-    # Append real NVIDIA catalog models in Anthropic format.
+    # Append real NVIDIA catalog models in Anthropic format (also filtered).
     for m in nvidia_data:
         mid = m.get("id", "")
-        if mid and mid not in seen:
+        if mid and mid not in seen and mid not in blocked:
             models.append(_to_anthropic(mid))
             seen.add(mid)
 
@@ -1253,6 +1300,7 @@ async def messages(request: Request):
                         body_err = _nvidia_error_message(resp.json())
                     except httpx.HTTPError:
                         break
+            body_err = _reformat_nvidia_error(body_err, payload.get("model", "unknown"))
             return JSONResp(
                 {
                     "type": "error",
@@ -1357,6 +1405,14 @@ async def stream_response(
                             if safe is not None:
                                 payload["max_tokens"] = safe
                                 continue
+                        # Reformat opaque NVIDIA errors before surfacing to client
+                        raw_msg = _nvidia_error_message(err_body)
+                        nvidia_model = payload.get("model", "unknown")
+                        if isinstance(err_body, dict):
+                            err = err_body.get("error") or {}
+                            if isinstance(err, dict):
+                                err["message"] = _reformat_nvidia_error(raw_msg, nvidia_model)
+                            err_body = {**err_body, "error": err}
                         await queue.put((ERROR, r.status_code, err_body))
                         return
                     async for line in r.aiter_lines():
