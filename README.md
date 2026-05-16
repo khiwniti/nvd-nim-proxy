@@ -6,8 +6,10 @@
 
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue?logo=python&logoColor=white)](https://python.org)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![PyPI](https://img.shields.io/badge/pypi-nvd--claude--nim-orange?logo=pypi&logoColor=white)](https://pypi.org/project/nvd-claude-nim)
-[![Tests](https://img.shields.io/badge/tests-20%20passing-brightgreen)](tests/)
+[![PyPI](https://img.shields.io/badge/pypi-nim--claude--proxy-orange?logo=pypi&logoColor=white)](https://pypi.org/project/nim-claude-proxy)
+[![Tests](https://img.shields.io/badge/tests-27%20passing-brightgreen)](tests/)
+
+<a href="https://deploy.workers.cloudflare.com/?url=https://github.com/khiwniti/nvd-nim-proxy"><img src="https://deploy.workers.cloudflare.com/button" alt="Deploy to Cloudflare"/></a>
 
 ```
 Claude Code ──/v1/messages──► nvd-nim-proxy ──/v1/chat/completions──► integrate.api.nvidia.com
@@ -32,7 +34,7 @@ Claude Code ──/v1/messages──► nvd-nim-proxy ──/v1/chat/completions
 
 ```bash
 # 1. Install
-pip install nvd-claude-nim
+pip install nim-claude-proxy
 
 # 2. Configure (guided wizard)
 nim init
@@ -57,6 +59,48 @@ nim code
 ```bash
 NVIDIA_API_KEY=nvapi-... nim code
 ```
+
+---
+
+## Deploy on Cloudflare
+
+This repository includes a Cloudflare Workers + Containers configuration at the repository root (`wrangler.toml`) and a Worker entrypoint in `worker/src/index.ts`. The Worker runs the Python FastAPI proxy inside a Cloudflare Container and forwards `/v1/messages`, `/v1/models`, and `/v1/messages/count_tokens` to it.
+
+**One-click:** use the **Deploy to Cloudflare** button above, then set the required secret in the created Worker project:
+
+```bash
+npx wrangler secret put NVIDIA_API_KEY
+npx wrangler secret put PROXY_API_KEY   # strongly recommended for public URLs
+```
+
+**Manual deploy:**
+
+```bash
+npm install
+npx wrangler secret put NVIDIA_API_KEY
+npx wrangler secret put PROXY_API_KEY   # optional locally, recommended publicly
+npm run deploy
+```
+
+Then point Claude Code at your Worker URL:
+
+```bash
+export ANTHROPIC_BASE_URL=https://your-worker.your-subdomain.workers.dev
+export ANTHROPIC_API_KEY=$PROXY_API_KEY
+export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
+export CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1
+export ENABLE_TOOL_SEARCH=false
+export CLAUDE_CODE_DISABLE_THINKING=1
+export DISABLE_INTERLEAVED_THINKING=1
+claude
+```
+
+Production notes:
+
+- `PROXY_API_KEY` protects your public Worker URL from becoming an open NVIDIA API relay.
+- Cloudflare builds and pushes the container image from `Dockerfile` during `wrangler deploy`; Docker must be available for manual local deploys.
+- The edge Worker returns `/healthz` and `/health` without waking the container and rejects unauthenticated `/v1/*` traffic before container startup when `PROXY_API_KEY` is configured.
+- Optional secrets/vars: `DEFAULT_NVIDIA_MODEL`, `MAX_OUTPUT_TOKENS`, `CONTEXT_SAFETY_MARGIN`, `LOG_LEVEL`.
 
 ---
 
@@ -141,6 +185,13 @@ export PROXY_HOST=127.0.0.1
 export PROXY_PORT=8787
 export PROXY_API_KEY=secret              # optional: require x-api-key from clients
 export LOG_LEVEL=info
+
+# Claude Code gateway compatibility knobs used by `nim code`
+export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
+export CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1
+export ENABLE_TOOL_SEARCH=false
+export CLAUDE_CODE_DISABLE_THINKING=1
+export DISABLE_INTERLEAVED_THINKING=1
 ```
 
 **Model aliases** in `config.example.yaml` map Claude Code model names to NVIDIA models automatically — no need to set `ANTHROPIC_DEFAULT_*_MODEL` manually when using `nim code`.
@@ -157,11 +208,12 @@ export LOG_LEVEL=info
 | `tool_result` round-trip | ✅ |
 | System prompts (string + block array) | ✅ |
 | Vision (base64 + URL) | ✅ |
-| Reasoning (`reasoning_content` + `<think>` tags) | ✅ |
+| Reasoning (`reasoning_content` + `<think>` tags) | ✅ response-side conversion; Anthropic-only thinking requests are disabled by `nim code` |
 | Token counting (`/v1/messages/count_tokens`) | ✅ heuristic ±15% |
-| Model listing (`/v1/models`) | ✅ proxied |
+| Model listing (`/v1/models`) | ✅ proxied; `claude-*` aliases support Claude Code gateway discovery |
 | Eager `message_start` (sub-100 ms TTFT) | ✅ |
 | 15 s ping heartbeat during reasoning | ✅ keeps TUI alive |
+| Context-window overflow retry | ✅ clamps output and retries once on NVIDIA tokenizer errors |
 | HTTP/2 to NVIDIA | ✅ when `h2` installed |
 | Client-disconnect cancellation | ✅ |
 | Prompt caching cost savings | ❌ not available on hosted endpoint |
@@ -178,6 +230,14 @@ Fixed by eager `message_start`. If still slow, NVIDIA's TTFT for Nemotron Ultra 
 
 **`404` on `claude-haiku-4-5` or similar**
 Use `nim code` instead of setting env vars manually — it sets all four `ANTHROPIC_DEFAULT_*_MODEL` vars correctly.
+
+**`400 maximum context length`**
+The proxy clamps `max_tokens` with a safety margin and retries once when NVIDIA reports an exact tokenizer limit. If you still hit this with very large Claude Code sessions, lower the completion budget:
+
+```bash
+export MAX_OUTPUT_TOKENS=8192
+export CONTEXT_SAFETY_MARGIN=4096
+```
 
 **`429 rate_limit_error`**
 Free tier is 40 RPM per key. Back off or upgrade to [NVIDIA AI Enterprise](https://www.nvidia.com/en-us/data-center/products/ai-enterprise/).
@@ -209,7 +269,7 @@ python3 nim_code.py code   # or: python3 proxy.py
 **Run tests:**
 
 ```bash
-python3 -m pytest -v          # 20 tests, no live API needed
+python3 -m pytest -v          # offline tests, no live API needed
 python3 -m pytest --cov=proxy --cov-report=term-missing
 ```
 

@@ -7,7 +7,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+---
+
+## [0.2.1] — 2026-05-16
+
 ### Added
+- Cloudflare Workers + Containers deployment support with root `wrangler.toml`,
+  Worker entrypoint, typecheck config, and a README deploy button.
+- Claude Code gateway alignment for `nim code`: gateway model discovery,
+  disabled Anthropic-only beta/tool-reference/thinking paths, and `/health`
+  alias alongside `/healthz`.
+- Context-window controls: `MAX_OUTPUT_TOKENS`, `CONTEXT_SAFETY_MARGIN`, YAML
+  config examples, and one-shot retry after NVIDIA tokenizer overflow errors.
+- Security headers on FastAPI responses and Cloudflare Worker edge responses.
+- Tests covering context-overflow retry, auth enforcement, and `/health` alias.
 - Interactive model picker shown before `nim code` launches — 20 flagship models
   from NVIDIA, DeepSeek, Qwen, Mistral, Z-AI, MiniMax, Moonshot, Meta, Google,
   OpenAI OSS, ByteDance, StepFun, and Writer; type a number, a model ID, or
@@ -22,7 +35,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `CLAUDE_CODE_SUBAGENT_MODEL` wired to the Haiku-tier model (fast model for
   background sub-agents).
 
+### Fixed
+- `PROXY_API_KEY` enforcement now returns auth failures from `/v1/messages` and
+  `/v1/messages/count_tokens` instead of continuing request handling.
+- README PyPI package references now use `nim-claude-proxy`, matching the
+  published package name.
+- `nim version` now reads the installed `nim-claude-proxy` distribution.
+
 ### Changed
+- Docker image now runs as a non-root `app` user with Python runtime hardening.
 - Default Opus slot: `deepseek-ai/deepseek-v4-pro` (was NVIDIA Ultra 253B).
 - Default Haiku slot: `minimaxai/minimax-m2.7` (was nano-9b-v2).
 - `config.example.yaml` documents all three tier-model fields.

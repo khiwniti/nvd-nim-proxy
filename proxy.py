@@ -31,25 +31,26 @@ Then in another shell, point Claude Code at it:
     export CLAUDE_CODE_SUBAGENT_MODEL=$M
     claude
 """
+
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import os
 import re
 import secrets
-from pathlib import Path
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
-from typing import AsyncIterator
+from pathlib import Path
+from typing import Any
 
 import httpx
 import orjson
 import uvicorn
 import yaml
-import hmac
 from fastapi import FastAPI, Request
 from fastapi.responses import Response, StreamingResponse
-
 
 # ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -58,49 +59,42 @@ DEFAULT_MODEL_ALIASES = {
     # ── Standard Claude Code aliases ─────────────────────────────────────────
     # Mapped to meaningful NVIDIA equivalents by capability tier so that
     # switching models in Claude Desktop actually changes the backend.
-    "claude-haiku-4-5":          "meta/llama-3.1-8b-instruct",           # fast / cheap
-    "claude-3-5-sonnet-20241022": DEFAULT_NVIDIA_MODEL,                   # balanced
+    "claude-haiku-4-5": "meta/llama-3.1-8b-instruct",  # fast / cheap
+    "claude-3-5-sonnet-20241022": DEFAULT_NVIDIA_MODEL,  # balanced
     "claude-3-7-sonnet-20250219": DEFAULT_NVIDIA_MODEL,
-    "claude-sonnet-4-20250514":  DEFAULT_NVIDIA_MODEL,
-    "claude-sonnet-4-5":         DEFAULT_NVIDIA_MODEL,
-    "claude-opus-4-1":           "nvidia/llama-3.1-nemotron-ultra-253b-v1",  # most capable
-
+    "claude-sonnet-4-20250514": DEFAULT_NVIDIA_MODEL,
+    "claude-sonnet-4-5": DEFAULT_NVIDIA_MODEL,
+    "claude-opus-4-1": "nvidia/llama-3.1-nemotron-ultra-253b-v1",  # most capable
     # ── NVIDIA catalog exposed as claude-nvidia-* ─────────────────────────
     # Claude Desktop only renders models whose id starts with "claude-".
     # These aliases make NVIDIA models selectable in the model picker.
-
     # Nemotron family
-    "claude-nvidia-nemotron-super-49b":  "nvidia/llama-3.3-nemotron-super-49b-v1.5",
+    "claude-nvidia-nemotron-super-49b": "nvidia/llama-3.3-nemotron-super-49b-v1.5",
     "claude-nvidia-nemotron-ultra-253b": "nvidia/llama-3.1-nemotron-ultra-253b-v1",
-    "claude-nvidia-nemotron-70b":        "nvidia/llama-3.1-nemotron-70b-instruct",
-    "claude-nvidia-nemotron-nano-8b":    "nvidia/llama-3.1-nemotron-nano-8b-v1",
-
+    "claude-nvidia-nemotron-70b": "nvidia/llama-3.1-nemotron-70b-instruct",
+    "claude-nvidia-nemotron-nano-8b": "nvidia/llama-3.1-nemotron-nano-8b-v1",
     # Meta Llama
-    "claude-nvidia-llama-70b":  "meta/llama-3.3-70b-instruct",
-    "claude-nvidia-llama-8b":   "meta/llama-3.1-8b-instruct",
+    "claude-nvidia-llama-70b": "meta/llama-3.3-70b-instruct",
+    "claude-nvidia-llama-8b": "meta/llama-3.1-8b-instruct",
     "claude-nvidia-llama-maverick": "meta/llama-4-maverick-17b-128e-instruct",
-
     # DeepSeek
-    "claude-nvidia-deepseek-v4-pro":   "deepseek-ai/deepseek-v4-pro",
+    "claude-nvidia-deepseek-v4-pro": "deepseek-ai/deepseek-v4-pro",
     "claude-nvidia-deepseek-v4-flash": "deepseek-ai/deepseek-v4-flash",
-
     # Mistral
-    "claude-nvidia-mistral-large":  "mistralai/mistral-large-2-instruct",
+    "claude-nvidia-mistral-large": "mistralai/mistral-large-2-instruct",
     "claude-nvidia-mistral-medium": "mistralai/mistral-medium-3.5-128b",
-
     # Qwen
-    "claude-nvidia-qwen3-coder":   "qwen/qwen3-coder-480b-a35b-instruct",
-    "claude-nvidia-qwen3-80b":     "qwen/qwen3-next-80b-a3b-instruct",
-
+    "claude-nvidia-qwen3-coder": "qwen/qwen3-coder-480b-a35b-instruct",
+    "claude-nvidia-qwen3-80b": "qwen/qwen3-next-80b-a3b-instruct",
     # Moonshot / MoonshotAI
     "claude-nvidia-kimi-k2": "moonshotai/kimi-k2.6",
-
     # Google Gemma
     "claude-nvidia-gemma-4-31b": "google/gemma-4-31b-it",
     "claude-nvidia-gemma-3-12b": "google/gemma-3-12b-it",
 }
 
-def _load_yaml_config() -> dict:
+
+def _load_yaml_config() -> dict[str, Any]:
     """Load non-secret config from YAML. Env vars remain authoritative.
 
     Set PROXY_CONFIG=/path/to/config.yaml to choose a file. If unset, a local
@@ -116,10 +110,12 @@ def _load_yaml_config() -> dict:
         raise RuntimeError(f"config file must contain a YAML mapping: {path}")
     return data
 
+
 _CONFIG = _load_yaml_config()
 _SERVER = _CONFIG.get("server") or {}
 _NVIDIA = _CONFIG.get("nvidia") or {}
 _STREAMING = _CONFIG.get("streaming") or {}
+_CONTEXT = _CONFIG.get("context") or {}
 
 NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY") or _NVIDIA.get("api_key")
 NVIDIA_BASE_URL = os.environ.get("NVIDIA_BASE_URL") or _NVIDIA.get(
@@ -137,7 +133,9 @@ MODEL_ALIASES = {**DEFAULT_MODEL_ALIASES}
 MODEL_ALIASES.update(_CONFIG.get("model_aliases") or {})
 for k, v in os.environ.items():
     if k.startswith("MODEL_ALIAS_") and v:
-        alias = k.removeprefix("MODEL_ALIAS_").lower().replace("__", "/").replace("_", "-")
+        alias = (
+            k.removeprefix("MODEL_ALIAS_").lower().replace("__", "/").replace("_", "-")
+        )
         MODEL_ALIASES[alias] = v
 for alias in list(MODEL_ALIASES):
     if MODEL_ALIASES[alias] == DEFAULT_NVIDIA_MODEL:
@@ -151,10 +149,24 @@ PING_INTERVAL = float(_STREAMING.get("ping_interval", 15.0))
 # We resplit on word/punctuation boundaries to recreate the "typing" feel.
 TEXT_DELTA_CHARS = int(_STREAMING.get("text_delta_chars", 6))
 
+# NVIDIA hosted endpoints reject input+output over the model context window.
+# Claude Code commonly asks for ~16k output tokens, so keep a safety margin for
+# tokenizer-estimation drift and upstream system/tool overhead.
+MAX_OUTPUT_TOKENS = int(
+    os.environ.get("MAX_OUTPUT_TOKENS") or _CONTEXT.get("max_output_tokens", 16384)
+)
+CONTEXT_SAFETY_MARGIN = int(
+    os.environ.get("CONTEXT_SAFETY_MARGIN")
+    or _CONTEXT.get("safety_margin_tokens", 2048)
+)
+
 # Static ISO timestamp for /v1/models created_at — per-call datetime.now()
 # makes every response look like a different model version.
-from datetime import datetime, timezone as _tz
+from datetime import datetime
+from datetime import timezone as _tz
+
 _PROXY_START_ISO = datetime.now(_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
 
 def resolve_model(requested: str) -> str:
     """Resolve a Claude Code requested model to an upstream NVIDIA model."""
@@ -169,12 +181,14 @@ def resolve_model(requested: str) -> str:
 
 # ─── Lifespan: one HTTP client for the whole process ─────────────────────────
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if not NVIDIA_API_KEY:
         raise RuntimeError("NVIDIA_API_KEY env var is required")
     try:
         import h2  # noqa: F401
+
         http2 = True
     except ImportError:
         http2 = False
@@ -199,11 +213,28 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="nvd-claude-proxy", version="1.0.0", lifespan=lifespan)
 
 
-def JSONResp(data: dict, status_code: int = 200) -> Response:
-    return Response(content=orjson.dumps(data), status_code=status_code, media_type="application/json")
+@app.middleware("http")
+async def security_headers(
+    request: Request, call_next: Callable[[Request], Awaitable[Response]]
+) -> Response:
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault("Cache-Control", "no-store")
+    response.headers.setdefault("Permissions-Policy", "interest-cohort=()")
+    return response
+
+
+def JSONResp(data: dict[str, Any], status_code: int = 200) -> Response:
+    return Response(
+        content=orjson.dumps(data),
+        status_code=status_code,
+        media_type="application/json",
+    )
 
 
 # ─── ID helpers ──────────────────────────────────────────────────────────────
+
 
 def new_msg_id() -> str:
     return "msg_" + secrets.token_urlsafe(18)
@@ -233,7 +264,7 @@ _TOOL_PROTOCOL_SYSTEM_PROMPT = """
 You are an expert at tool use. You MUST ALWAYS follow these rules:
 1. ALWAYS use the native `tool_calls` API for all tool interactions.
 2. NEVER output tags like `<command-name>`, `<command-arguments>`, or similar.
-3. If you need to call a tool, generate the `tool_calls` field in your response. 
+3. If you need to call a tool, generate the `tool_calls` field in your response.
 4. DO NOT explain your tool call or output any text before the tool call if possible.
 5. If you hallucinate a tag, you will be stopped. Use ONLY JSON for tool calls.
 """
@@ -261,9 +292,7 @@ def image_block_to_openai(block: dict) -> dict:
     return {"type": "text", "text": f"[unsupported image source type: {t}]"}
 
 
-def translate_messages(
-    messages: list[dict], tool_id_map: dict[str, str]
-) -> list[dict]:
+def translate_messages(messages: list[dict], tool_id_map: dict[str, str]) -> list[dict]:
     """Anthropic message list → OpenAI message list.
 
     Each Anthropic user message that contains tool_result blocks explodes into
@@ -292,14 +321,16 @@ def translate_messages(
                 text_parts.append(image_block_to_openai(block))
             elif btype == "tool_use":
                 tool_id_map[block["id"]] = block["id"]
-                tool_calls.append({
-                    "id": block["id"],
-                    "type": "function",
-                    "function": {
-                        "name": block["name"],
-                        "arguments": json.dumps(block.get("input") or {}),
-                    },
-                })
+                tool_calls.append(
+                    {
+                        "id": block["id"],
+                        "type": "function",
+                        "function": {
+                            "name": block["name"],
+                            "arguments": json.dumps(block.get("input") or {}),
+                        },
+                    }
+                )
             elif btype == "tool_result":
                 tid = block["tool_use_id"]
                 openai_id = tool_id_map.get(tid, tid)
@@ -308,11 +339,13 @@ def translate_messages(
                     raw = "".join(
                         b.get("text", "") for b in raw if b.get("type") == "text"
                     )
-                tool_results.append({
-                    "role": "tool",
-                    "tool_call_id": openai_id,
-                    "content": str(raw) if raw is not None else "",
-                })
+                tool_results.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": openai_id,
+                        "content": str(raw) if raw is not None else "",
+                    }
+                )
             # thinking / redacted_thinking / document blocks: drop silently.
             # NVIDIA cannot consume opaque Anthropic signatures, and PDFs
             # would need server-side text extraction (out of MVP scope).
@@ -332,14 +365,16 @@ def translate_messages(
             out.append(msg)
         else:  # user
             if text_parts:
-                out.append({
-                    "role": "user",
-                    "content": (
-                        "".join(p["text"] for p in text_parts)
-                        if all(p["type"] == "text" for p in text_parts)
-                        else text_parts
-                    ),
-                })
+                out.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "".join(p["text"] for p in text_parts)
+                            if all(p["type"] == "text" for p in text_parts)
+                            else text_parts
+                        ),
+                    }
+                )
             out.extend(tool_results)
     return out
 
@@ -389,16 +424,17 @@ def translate_tools(
         if len(desc) > desc_cap:
             desc = desc[:desc_cap] + "..."
 
-        out.append({
-            "type": "function",
-            "function": {
-                "name": _safe_tool_name(t["name"], tool_name_map),
-                "description": desc,
-                "parameters": t.get("input_schema") or {
-                    "type": "object", "properties": {}
+        out.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": _safe_tool_name(t["name"], tool_name_map),
+                    "description": desc,
+                    "parameters": t.get("input_schema")
+                    or {"type": "object", "properties": {}},
                 },
-            },
-        })
+            }
+        )
     return out or None
 
 
@@ -419,7 +455,13 @@ def translate_tool_choice(tc):
     return "auto"
 
 
-def translate_request(body: dict, tool_id_map: dict[str, str], tool_name_map: dict[str, str]) -> dict:
+def translate_request(
+    body: dict,
+    tool_id_map: dict[str, str],
+    tool_name_map: dict[str, str] | None = None,
+) -> dict:
+    if tool_name_map is None:
+        tool_name_map = {}
     msgs: list[dict] = []
     sys = flatten_system(body.get("system"))
 
@@ -441,7 +483,7 @@ def translate_request(body: dict, tool_id_map: dict[str, str], tool_name_map: di
     nvidia_model = resolve_model(body["model"])
     ctx_limit = _context_limit_for(nvidia_model)
 
-    max_tokens = min(body.get("max_tokens") or 4096, 16384)
+    max_tokens = min(body.get("max_tokens") or 4096, MAX_OUTPUT_TOKENS)
 
     # Walk the full message tree to estimate input tokens — nested content blocks
     # (tool_result, image, thinking) would be missed by a flat .get("content") call.
@@ -451,12 +493,15 @@ def translate_request(body: dict, tool_id_map: dict[str, str], tool_name_map: di
         if isinstance(obj, list):
             return sum(_count_chars(v) for v in obj)
         if isinstance(obj, dict):
-            return sum(_count_chars(v) for k, v in obj.items()
-                       if k not in ("type", "media_type", "cache_control"))
+            return sum(
+                _count_chars(v)
+                for k, v in obj.items()
+                if k not in ("type", "media_type", "cache_control")
+            )
         return 0
 
     estimated_input = _count_chars(msgs) // 4
-    headroom = ctx_limit - estimated_input - 128  # 128-token safety margin
+    headroom = ctx_limit - estimated_input - CONTEXT_SAFETY_MARGIN
     if headroom < max_tokens:
         max_tokens = max(1, headroom)
 
@@ -471,13 +516,13 @@ def translate_request(body: dict, tool_id_map: dict[str, str], tool_name_map: di
             payload[key] = v
     if (ss := body.get("stop_sequences")) is not None:
         payload["stop"] = ss
-    if (tools := translate_tools(body.get("tools"), tool_name_map)):
+    if tools := translate_tools(body.get("tools"), tool_name_map):
         payload["tools"] = tools
         if (tc := translate_tool_choice(body.get("tool_choice"))) is not None:
             payload["tool_choice"] = tc
     # Forward Claude Code's metadata.user_id as OpenAI's `user`
     if (md := body.get("metadata")) and isinstance(md, dict):
-        if (uid := md.get("user_id")):
+        if uid := md.get("user_id"):
             payload["user"] = str(uid)
     return payload
 
@@ -495,18 +540,25 @@ FINISH_TO_STOP = {
 }
 
 
-def extract_thinking(content: str | None, reasoning: str | None) -> tuple[str | None, str]:
+def extract_thinking(
+    content: str | None, reasoning: str | None
+) -> tuple[str | None, str]:
     """Return (thinking_text, remaining_content). Handles both surfaces:
     a separate `reasoning_content` field, or inline <think>…</think> tags."""
     if reasoning:
         return reasoning, content or ""
     if content and "<think>" in content:
-        if (m := THINK_RE.search(content)):
+        if m := THINK_RE.search(content):
             return m.group(1).strip(), THINK_RE.sub("", content, count=1).lstrip()
     return None, content or ""
 
 
-def translate_response(oai: dict, model: str, tool_id_map: dict[str, str], tool_name_map: dict[str, str] | None = None) -> dict:
+def translate_response(
+    oai: dict,
+    model: str,
+    tool_id_map: dict[str, str],
+    tool_name_map: dict[str, str] | None = None,
+) -> dict:
     choice = (oai.get("choices") or [{}])[0]
     msg = choice.get("message") or {}
     blocks: list[dict] = []
@@ -515,11 +567,13 @@ def translate_response(oai: dict, model: str, tool_id_map: dict[str, str], tool_
         msg.get("content"), msg.get("reasoning_content")
     )
     if thinking:
-        blocks.append({
-            "type": "thinking",
-            "thinking": thinking,
-            "signature": new_signature(),
-        })
+        blocks.append(
+            {
+                "type": "thinking",
+                "thinking": thinking,
+                "signature": new_signature(),
+            }
+        )
     if remaining:
         blocks.append({"type": "text", "text": remaining})
 
@@ -534,12 +588,14 @@ def translate_response(oai: dict, model: str, tool_id_map: dict[str, str], tool_
         tool_id_map[anth_id] = oid
         truncated_name = fn.get("name", "")
         original_name = (tool_name_map or {}).get(truncated_name, truncated_name)
-        blocks.append({
-            "type": "tool_use",
-            "id": anth_id,
-            "name": original_name,
-            "input": args,
-        })
+        blocks.append(
+            {
+                "type": "tool_use",
+                "id": anth_id,
+                "name": original_name,
+                "input": args,
+            }
+        )
 
     usage = oai.get("usage") or {}
     return {
@@ -602,7 +658,12 @@ class StreamTranslator:
     modalities (text↔thinking↔tool_use) closes the previous block first.
     """
 
-    def __init__(self, model: str, tool_id_map: dict[str, str], tool_name_map: dict[str, str] | None = None):
+    def __init__(
+        self,
+        model: str,
+        tool_id_map: dict[str, str],
+        tool_name_map: dict[str, str] | None = None,
+    ):
         self.model = model
         self.tool_id_map = tool_id_map
         self.tool_name_map = tool_name_map or {}
@@ -627,18 +688,25 @@ class StreamTranslator:
         if self.open_index is None:
             return
         if self.open_type == "thinking" and not self.signature_sent:
-            yield self._ev("content_block_delta", {
-                "type": "content_block_delta",
-                "index": self.open_index,
-                "delta": {
-                    "type": "signature_delta",
-                    "signature": new_signature(),
+            yield self._ev(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": self.open_index,
+                    "delta": {
+                        "type": "signature_delta",
+                        "signature": new_signature(),
+                    },
                 },
-            })
+            )
             self.signature_sent = True
-        yield self._ev("content_block_stop", {
-            "type": "content_block_stop", "index": self.open_index,
-        })
+        yield self._ev(
+            "content_block_stop",
+            {
+                "type": "content_block_stop",
+                "index": self.open_index,
+            },
+        )
         self.open_type = None
         self.open_index = None
         self.signature_sent = False
@@ -648,11 +716,14 @@ class StreamTranslator:
         self.next_index += 1
         self.open_type = "text"
         self.open_index = idx
-        yield self._ev("content_block_start", {
-            "type": "content_block_start",
-            "index": idx,
-            "content_block": {"type": "text", "text": ""},
-        })
+        yield self._ev(
+            "content_block_start",
+            {
+                "type": "content_block_start",
+                "index": idx,
+                "content_block": {"type": "text", "text": ""},
+            },
+        )
 
     def _open_thinking(self):
         idx = self.next_index
@@ -660,11 +731,14 @@ class StreamTranslator:
         self.open_type = "thinking"
         self.open_index = idx
         self.signature_sent = False
-        yield self._ev("content_block_start", {
-            "type": "content_block_start",
-            "index": idx,
-            "content_block": {"type": "thinking", "thinking": "", "signature": ""},
-        })
+        yield self._ev(
+            "content_block_start",
+            {
+                "type": "content_block_start",
+                "index": idx,
+                "content_block": {"type": "thinking", "thinking": "", "signature": ""},
+            },
+        )
 
     def _emit_text(self, s: str):
         if not s:
@@ -673,11 +747,14 @@ class StreamTranslator:
             yield from self._close_open()
             yield from self._open_text()
         for piece in retokenize(s):
-            yield self._ev("content_block_delta", {
-                "type": "content_block_delta",
-                "index": self.open_index,
-                "delta": {"type": "text_delta", "text": piece},
-            })
+            yield self._ev(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": self.open_index,
+                    "delta": {"type": "text_delta", "text": piece},
+                },
+            )
 
     def _emit_thinking(self, s: str):
         if not s:
@@ -686,11 +763,14 @@ class StreamTranslator:
             yield from self._close_open()
             yield from self._open_thinking()
         for piece in retokenize(s):
-            yield self._ev("content_block_delta", {
-                "type": "content_block_delta",
-                "index": self.open_index,
-                "delta": {"type": "thinking_delta", "thinking": piece},
-            })
+            yield self._ev(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": self.open_index,
+                    "delta": {"type": "thinking_delta", "thinking": piece},
+                },
+            )
 
     def _process_text(self, s: str):
         """Watch for <think>…</think> tags that may straddle chunk boundaries."""
@@ -710,7 +790,7 @@ class StreamTranslator:
                 yield from self._emit_thinking(buf[:idx])
                 yield from self._close_open()
                 self.in_inline_think = False
-                buf = buf[idx + len(_THINK_CLOSE):]
+                buf = buf[idx + len(_THINK_CLOSE) :]
             else:
                 idx = buf.find(_THINK_OPEN)
                 if idx == -1:
@@ -725,12 +805,12 @@ class StreamTranslator:
                 yield from self._close_open()
                 yield from self._open_thinking()
                 self.in_inline_think = True
-                buf = buf[idx + len(_THINK_OPEN):]
+                buf = buf[idx + len(_THINK_OPEN) :]
 
     def feed(self, chunk: dict):
         # Trailing usage-only chunk (choices == [])
         if not chunk.get("choices"):
-            if (u := chunk.get("usage")):
+            if u := chunk.get("usage"):
                 self.usage_in = u.get("prompt_tokens", self.usage_in)
                 self.usage_out = u.get("completion_tokens", self.usage_out)
             return
@@ -739,21 +819,27 @@ class StreamTranslator:
         delta = choice.get("delta") or {}
         finish = choice.get("finish_reason")
 
-        if (rc := delta.get("reasoning_content")):
+        if rc := delta.get("reasoning_content"):
             yield from self._emit_thinking(rc)
-        if (text := delta.get("content")):
+        if text := delta.get("content"):
             yield from self._process_text(text)
 
         for tc in delta.get("tool_calls") or []:
             o_idx = tc.get("index", 0)
-            buf = self.tools.setdefault(o_idx, {
-                "oid": None, "name": None, "started": False,
-                "anth_id": None, "anth_idx": None,
-            })
+            buf = self.tools.setdefault(
+                o_idx,
+                {
+                    "oid": None,
+                    "name": None,
+                    "started": False,
+                    "anth_id": None,
+                    "anth_idx": None,
+                },
+            )
             fn = tc.get("function") or {}
-            if (i := tc.get("id")):
+            if i := tc.get("id"):
                 buf["oid"] = i
-            if (n := fn.get("name")):
+            if n := fn.get("name"):
                 buf["name"] = n
             args = fn.get("arguments")
 
@@ -770,25 +856,31 @@ class StreamTranslator:
                 self.open_index = buf["anth_idx"]
                 buf["started"] = True
                 original_name = self.tool_name_map.get(buf["name"], buf["name"])
-                yield self._ev("content_block_start", {
-                    "type": "content_block_start",
-                    "index": buf["anth_idx"],
-                    "content_block": {
-                        "type": "tool_use",
-                        "id": anth_id,
-                        "name": original_name,
-                        "input": {},
+                yield self._ev(
+                    "content_block_start",
+                    {
+                        "type": "content_block_start",
+                        "index": buf["anth_idx"],
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": anth_id,
+                            "name": original_name,
+                            "input": {},
+                        },
                     },
-                })
+                )
             if buf["started"] and args:
-                yield self._ev("content_block_delta", {
-                    "type": "content_block_delta",
-                    "index": buf["anth_idx"],
-                    "delta": {
-                        "type": "input_json_delta",
-                        "partial_json": args,
+                yield self._ev(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": buf["anth_idx"],
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": args,
+                        },
                     },
-                })
+                )
 
         if finish:
             if self.text_buf:
@@ -806,34 +898,45 @@ class StreamTranslator:
             )(self.text_buf)
             self.text_buf = ""
         yield from self._close_open()
-        yield self._ev("message_delta", {
-            "type": "message_delta",
-            "delta": {
-                "stop_reason": self.stop_reason,
-                "stop_sequence": None,
+        yield self._ev(
+            "message_delta",
+            {
+                "type": "message_delta",
+                "delta": {
+                    "stop_reason": self.stop_reason,
+                    "stop_sequence": None,
+                },
+                "usage": {
+                    "input_tokens": self.usage_in,
+                    "output_tokens": self.usage_out,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                },
             },
-            "usage": {
-                "input_tokens": self.usage_in,
-                "output_tokens": self.usage_out,
-                "cache_creation_input_tokens": 0,
-                "cache_read_input_tokens": 0,
-            },
-        })
+        )
         yield self._ev("message_stop", {"type": "message_stop"})
 
 
 # ─── HTTP routes ─────────────────────────────────────────────────────────────
+
 
 def encode_sse(event: str, data: dict) -> bytes:
     return b"event: " + event.encode() + b"\ndata: " + orjson.dumps(data) + b"\n\n"
 
 
 STATUS_TO_ERR = {
-    400: "invalid_request_error", 401: "authentication_error",
-    403: "permission_error", 404: "not_found_error",
-    413: "request_too_large", 422: "invalid_request_error",
-    429: "rate_limit_error", 500: "api_error", 502: "api_error",
-    503: "overloaded_error", 504: "api_error", 529: "overloaded_error",
+    400: "invalid_request_error",
+    401: "authentication_error",
+    403: "permission_error",
+    404: "not_found_error",
+    413: "request_too_large",
+    422: "invalid_request_error",
+    429: "rate_limit_error",
+    500: "api_error",
+    502: "api_error",
+    503: "overloaded_error",
+    504: "api_error",
+    529: "overloaded_error",
 }
 
 
@@ -841,7 +944,7 @@ def map_error_type(status: int) -> str:
     return STATUS_TO_ERR.get(status, "api_error")
 
 
-def _nvidia_error_message(body: dict | str) -> str:
+def _nvidia_error_message(body: dict[str, Any] | str | bytes | bytearray) -> str:
     """Extract a human-readable message from NVIDIA/OpenAI error payloads.
 
     NVIDIA wraps errors as {"error": {"message": "...", "type": "BadRequestError"}}.
@@ -869,16 +972,17 @@ def _nvidia_error_message(body: dict | str) -> str:
 # "maximum context length is 131072 tokens. However, you requested 16384 output
 #  tokens and your prompt contains at least 114689 input tokens"
 _CTX_OVERFLOW_RE = re.compile(
-    r"maximum context length is (\d+) tokens.*?"
-    r"requested (\d+) output tokens.*?"
-    r"contains at least (\d+) input tokens",
-    re.DOTALL,
+    r"maximum\s+context\s+length\s+is\s+(\d+)\s+tokens.*?"
+    r"requested\s+(\d+)\s+output\s+tokens.*?"
+    r"(?:prompt\s+)?contains\s+at\s+least\s+(\d+)\s+input\s+tokens",
+    re.IGNORECASE | re.DOTALL,
 )
 
 # Fallback for other wording variations from older NIM versions.
 _CTX_OVERFLOW_RE2 = re.compile(
-    r"passed (\d+) input tokens and requested (\d+).*?context length is only (\d+)",
-    re.DOTALL,
+    r"passed\s+(\d+)\s+input\s+tokens\s+and\s+requested\s+(\d+).*?"
+    r"context\s+length\s+is\s+(?:only\s+)?(\d+)\s+tokens",
+    re.IGNORECASE | re.DOTALL,
 )
 
 # Per-model context window registry (same pattern as LiteLLM).
@@ -888,37 +992,37 @@ _CTX_OVERFLOW_RE2 = re.compile(
 FALLBACK_CONTEXT_LIMIT = 131072
 MODEL_CONTEXT_REGISTRY: dict[str, int] = {
     # Nemotron
-    "nvidia/llama-3.3-nemotron-super-49b-v1.5":  131072,
-    "nvidia/llama-3.1-nemotron-ultra-253b-v1":   131072,
-    "nvidia/llama-3.1-nemotron-70b-instruct":    131072,
-    "nvidia/llama-3.1-nemotron-nano-8b-v1":      131072,
+    "nvidia/llama-3.3-nemotron-super-49b-v1.5": 131072,
+    "nvidia/llama-3.1-nemotron-ultra-253b-v1": 131072,
+    "nvidia/llama-3.1-nemotron-70b-instruct": 131072,
+    "nvidia/llama-3.1-nemotron-nano-8b-v1": 131072,
     # Meta Llama 3.x
-    "meta/llama-3.3-70b-instruct":               131072,
-    "meta/llama-3.1-70b-instruct":               131072,
-    "meta/llama-3.1-8b-instruct":                131072,
-    "meta/llama-3.2-90b-vision-instruct":        131072,
-    "meta/llama-3.2-11b-vision-instruct":        131072,
-    "meta/llama-3.2-3b-instruct":                131072,
-    "meta/llama-3.2-1b-instruct":                131072,
-    "meta/llama-4-maverick-17b-128e-instruct":   524288,
+    "meta/llama-3.3-70b-instruct": 131072,
+    "meta/llama-3.1-70b-instruct": 131072,
+    "meta/llama-3.1-8b-instruct": 131072,
+    "meta/llama-3.2-90b-vision-instruct": 131072,
+    "meta/llama-3.2-11b-vision-instruct": 131072,
+    "meta/llama-3.2-3b-instruct": 131072,
+    "meta/llama-3.2-1b-instruct": 131072,
+    "meta/llama-4-maverick-17b-128e-instruct": 524288,
     # DeepSeek
-    "deepseek-ai/deepseek-v4-pro":               163840,
-    "deepseek-ai/deepseek-v4-flash":             163840,
+    "deepseek-ai/deepseek-v4-pro": 163840,
+    "deepseek-ai/deepseek-v4-flash": 163840,
     # Mistral
-    "mistralai/mistral-large-2-instruct":        131072,
-    "mistralai/mistral-medium-3.5-128b":         131072,
+    "mistralai/mistral-large-2-instruct": 131072,
+    "mistralai/mistral-medium-3.5-128b": 131072,
     "mistralai/mistral-large-3-675b-instruct-2512": 131072,
-    "mistralai/mixtral-8x22b-instruct-v0.1":     65536,
-    "mistralai/mixtral-8x7b-instruct-v0.1":      32768,
+    "mistralai/mixtral-8x22b-instruct-v0.1": 65536,
+    "mistralai/mixtral-8x7b-instruct-v0.1": 32768,
     # Qwen
-    "qwen/qwen3-coder-480b-a35b-instruct":       131072,
-    "qwen/qwen3-next-80b-a3b-instruct":          131072,
-    "qwen/qwen3.5-122b-a10b":                    131072,
+    "qwen/qwen3-coder-480b-a35b-instruct": 131072,
+    "qwen/qwen3-next-80b-a3b-instruct": 131072,
+    "qwen/qwen3.5-122b-a10b": 131072,
     # Moonshot
-    "moonshotai/kimi-k2.6":                      131072,
+    "moonshotai/kimi-k2.6": 131072,
     # Google Gemma
-    "google/gemma-4-31b-it":                     131072,
-    "google/gemma-3-12b-it":                     131072,
+    "google/gemma-4-31b-it": 131072,
+    "google/gemma-3-12b-it": 131072,
 }
 
 
@@ -932,13 +1036,13 @@ def _context_safe_max_tokens(err_msg: str) -> int | None:
     m = _CTX_OVERFLOW_RE.search(err_msg)
     if m:
         ctx, input_toks = int(m.group(1)), int(m.group(3))
-        safe = ctx - input_toks - 1
-        return safe if safe > 0 else None
+        safe = ctx - input_toks - max(CONTEXT_SAFETY_MARGIN, 1)
+        return min(safe, MAX_OUTPUT_TOKENS) if safe > 0 else None
     m2 = _CTX_OVERFLOW_RE2.search(err_msg)
     if m2:
         input_toks, ctx = int(m2.group(1)), int(m2.group(3))
-        safe = ctx - input_toks - 1
-        return safe if safe > 0 else None
+        safe = ctx - input_toks - max(CONTEXT_SAFETY_MARGIN, 1)
+        return min(safe, MAX_OUTPUT_TOKENS) if safe > 0 else None
     return None
 
 
@@ -951,12 +1055,19 @@ def check_auth(request: Request):
     )
     if not hmac.compare_digest(presented, PROXY_API_KEY):
         return JSONResp(
-            {"type": "error", "error": {"type": "authentication_error", "message": "invalid proxy api key"}},
+            {
+                "type": "error",
+                "error": {
+                    "type": "authentication_error",
+                    "message": "invalid proxy api key",
+                },
+            },
             status_code=401,
         )
 
 
 @app.get("/healthz")
+@app.get("/health")
 async def healthz():
     return {"status": "ok"}
 
@@ -1012,19 +1123,23 @@ async def list_models(request: Request):
             models.append(_to_anthropic(mid))
             seen.add(mid)
 
-    return JSONResp({
-        "data": models,
-        "has_more": False,
-        "first_id": models[0]["id"] if models else None,
-        "last_id": models[-1]["id"] if models else None,
-    })
+    return JSONResp(
+        {
+            "data": models,
+            "has_more": False,
+            "first_id": models[0]["id"] if models else None,
+            "last_id": models[-1]["id"] if models else None,
+        }
+    )
 
 
 @app.post("/v1/messages/count_tokens")
 async def count_tokens(request: Request):
     """Heuristic token count — NVIDIA's hosted catalog has no native endpoint
     for this. ~4 chars/token holds within ±15% for Llama/Nemotron/Qwen."""
-    check_auth(request)
+    auth = check_auth(request)
+    if auth is not None:
+        return auth
     body = await request.json()
 
     def walk(o):
@@ -1041,20 +1156,28 @@ async def count_tokens(request: Request):
 
 @app.post("/v1/messages")
 async def messages(request: Request):
-    check_auth(request)
+    auth = check_auth(request)
+    if auth is not None:
+        return auth
     try:
         body = await request.json()
     except Exception as e:
         return JSONResp(
-            {"type": "error",
-             "error": {"type": "invalid_request_error", "message": f"bad JSON: {e}"}},
+            {
+                "type": "error",
+                "error": {"type": "invalid_request_error", "message": f"bad JSON: {e}"},
+            },
             status_code=400,
         )
     if "model" not in body or "messages" not in body:
         return JSONResp(
-            {"type": "error",
-             "error": {"type": "invalid_request_error",
-                       "message": "model and messages are required"}},
+            {
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "model and messages are required",
+                },
+            },
             status_code=400,
         )
 
@@ -1069,8 +1192,10 @@ async def messages(request: Request):
             resp = await nvidia.post("/chat/completions", json=payload)
         except httpx.HTTPError as e:
             return JSONResp(
-                {"type": "error",
-                 "error": {"type": "api_error", "message": str(e)[:500]}},
+                {
+                    "type": "error",
+                    "error": {"type": "api_error", "message": str(e)[:500]},
+                },
                 status_code=502,
             )
         if resp.status_code >= 400:
@@ -1086,17 +1211,30 @@ async def messages(request: Request):
                     try:
                         resp = await nvidia.post("/chat/completions", json=payload)
                         if resp.status_code < 400:
-                            return JSONResp(translate_response(resp.json(), body["model"], tool_id_map, tool_name_map))
+                            return JSONResp(
+                                translate_response(
+                                    resp.json(),
+                                    body["model"],
+                                    tool_id_map,
+                                    tool_name_map,
+                                )
+                            )
                         body_err = _nvidia_error_message(resp.json())
                     except httpx.HTTPError:
                         pass
             return JSONResp(
-                {"type": "error",
-                 "error": {"type": map_error_type(resp.status_code),
-                           "message": body_err}},
+                {
+                    "type": "error",
+                    "error": {
+                        "type": map_error_type(resp.status_code),
+                        "message": body_err,
+                    },
+                },
                 status_code=resp.status_code,
             )
-        return JSONResp(translate_response(resp.json(), body["model"], tool_id_map, tool_name_map))
+        return JSONResp(
+            translate_response(resp.json(), body["model"], tool_id_map, tool_name_map)
+        )
 
     # Streaming path
     return StreamingResponse(
@@ -1105,14 +1243,17 @@ async def messages(request: Request):
         headers={
             "Cache-Control": "no-cache, no-transform",
             "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",         # defeat nginx/proxy buffering
-            "Content-Encoding": "identity",    # never gzip an SSE stream
+            "X-Accel-Buffering": "no",  # defeat nginx/proxy buffering
+            "Content-Encoding": "identity",  # never gzip an SSE stream
         },
     )
 
 
 async def stream_response(
-    request: Request, body: dict, payload: dict, tool_id_map: dict[str, str],
+    request: Request,
+    body: dict,
+    payload: dict,
+    tool_id_map: dict[str, str],
     tool_name_map: dict[str, str] | None = None,
 ) -> AsyncIterator[bytes]:
     """The hot path. Three things to remember:
@@ -1125,24 +1266,31 @@ async def stream_response(
     msg_id = new_msg_id()
 
     # 1) Eager message_start — synchronous yield before any await.
-    yield encode_sse("message_start", {
-        "type": "message_start",
-        "message": {
-            "id": msg_id,
-            "type": "message",
-            "role": "assistant",
-            "content": [],
-            "model": model,
-            "stop_reason": None,
-            "stop_sequence": None,
-            "usage": {
-                "input_tokens": 0, "output_tokens": 0,
-                "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+    yield encode_sse(
+        "message_start",
+        {
+            "type": "message_start",
+            "message": {
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": model,
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                },
             },
         },
-    })
+    )
 
-    st = StreamTranslator(model=model, tool_id_map=tool_id_map, tool_name_map=tool_name_map or {})
+    st = StreamTranslator(
+        model=model, tool_id_map=tool_id_map, tool_name_map=tool_name_map or {}
+    )
     payload = {
         **payload,
         "stream": True,
@@ -1169,7 +1317,9 @@ async def stream_response(
                             err_body = body_bytes.decode(errors="replace")
                         # Auto-retry once on context-length overflow
                         if r.status_code == 400 and attempt == 0:
-                            safe = _context_safe_max_tokens(_nvidia_error_message(err_body))
+                            safe = _context_safe_max_tokens(
+                                _nvidia_error_message(err_body)
+                            )
                             if safe is not None:
                                 payload["max_tokens"] = safe
                                 continue
@@ -1206,14 +1356,21 @@ async def stream_response(
                 break
             if isinstance(item, tuple) and item and item[0] is ERROR:
                 _, status, err_body = item
-                msg = _nvidia_error_message(err_body) if isinstance(err_body, (dict, str, bytes)) else str(err_body)[:500]
-                yield encode_sse("error", {
-                    "type": "error",
-                    "error": {
-                        "type": map_error_type(status or 500),
-                        "message": msg,
+                msg = (
+                    _nvidia_error_message(err_body)
+                    if isinstance(err_body, (dict, str, bytes))
+                    else str(err_body)[:500]
+                )
+                yield encode_sse(
+                    "error",
+                    {
+                        "type": "error",
+                        "error": {
+                            "type": map_error_type(status or 500),
+                            "message": msg,
+                        },
                     },
-                })
+                )
                 break
             for ev in st.feed(item):
                 yield encode_sse(ev["event"], ev["data"])
@@ -1230,21 +1387,24 @@ async def stream_response(
 
 # ─── Entrypoint ──────────────────────────────────────────────────────────────
 
+
 def main():
     if not NVIDIA_API_KEY:
         raise SystemExit("NVIDIA_API_KEY env var is required")
 
     # Prefer uvloop+httptools if available; fall back to asyncio default.
-    kwargs = {"host": PROXY_HOST, "port": PROXY_PORT, "log_level": LOG_LEVEL,
-              "access_log": False}
+    loop = "auto"
+    http = "auto"
     try:
         import uvloop  # noqa: F401
-        kwargs["loop"] = "uvloop"
+
+        loop = "uvloop"
     except ImportError:
         pass
     try:
         import httptools  # noqa: F401
-        kwargs["http"] = "httptools"
+
+        http = "httptools"
     except ImportError:
         pass
 
@@ -1253,10 +1413,19 @@ def main():
     print(f"  upstream    → {NVIDIA_BASE_URL}")
     print(f"  default     → {DEFAULT_MODEL}")
     print(f"  aliases     → {len(MODEL_ALIASES)} configured")
-    print(f"  point Claude Code's ANTHROPIC_BASE_URL at http://{PROXY_HOST}:{PROXY_PORT}\n")
-    uvicorn.run(app, **kwargs)
+    print(
+        f"  point Claude Code's ANTHROPIC_BASE_URL at http://{PROXY_HOST}:{PROXY_PORT}\n"
+    )
+    uvicorn.run(
+        app,
+        host=str(PROXY_HOST),
+        port=int(PROXY_PORT),
+        log_level=str(LOG_LEVEL),
+        access_log=False,
+        loop=loop,
+        http=http,
+    )
 
 
 if __name__ == "__main__":
     main()
-

@@ -25,6 +25,13 @@ streaming:
   ping_interval: 15.0
   text_delta_chars: 6
 
+context:
+  # Claude Code may request very large completions. The proxy clamps output so
+  # input + output stays inside NVIDIA's model context window and retries once
+  # if the upstream tokenizer reports a tighter limit.
+  max_output_tokens: 16384
+  safety_margin_tokens: 2048
+
 model_aliases:
   claude-3-5-sonnet-20241022: nvidia/llama-3.3-nemotron-super-49b-v1.5
   claude-3-7-sonnet-20250219: nvidia/llama-3.3-nemotron-super-49b-v1.5

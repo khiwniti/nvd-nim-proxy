@@ -1,0 +1,17 @@
+name = "nvd-nim-proxy"
+main = "worker/src/index.ts"
+compatibility_date = "2026-05-16"
+
+[[containers]]
+class_name = "NimProxyContainer"
+image = "./Dockerfile"
+max_instances = 3
+instance_type = "basic"
+
+[[durable_objects.bindings]]
+name = "NIM_PROXY"
+class_name = "NimProxyContainer"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["NimProxyContainer"]

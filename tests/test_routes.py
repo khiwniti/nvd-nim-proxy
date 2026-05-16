@@ -4,6 +4,7 @@ Bypasses the FastAPI lifespan (which requires NVIDIA_API_KEY) so these
 tests can run offline. /healthz needs no upstream client; /v1/messages
 auth-rejection and validation paths run before any upstream call.
 """
+
 from fastapi.testclient import TestClient
 
 import proxy
@@ -24,6 +25,13 @@ def test_healthz_returns_ok():
     assert r.json() == {"status": "ok"}
 
 
+def test_health_alias_returns_ok():
+    with _client() as c:
+        r = c.get("/health")
+    assert r.status_code == 200
+    assert r.json() == {"status": "ok"}
+
+
 def test_messages_rejects_missing_required_fields():
     with _client() as c:
         r = c.post("/v1/messages", json={"model": "claude-3-5-sonnet-20241022"})
@@ -31,3 +39,19 @@ def test_messages_rejects_missing_required_fields():
     body = r.json()
     assert body["type"] == "error"
     assert body["error"]["type"] == "invalid_request_error"
+
+
+def test_messages_enforces_proxy_api_key(monkeypatch):
+    monkeypatch.setattr(proxy, "PROXY_API_KEY", "secret")
+    with _client() as c:
+        r = c.post("/v1/messages", json={"model": "x", "messages": []})
+    assert r.status_code == 401
+    assert r.json()["error"]["type"] == "authentication_error"
+
+
+def test_count_tokens_enforces_proxy_api_key(monkeypatch):
+    monkeypatch.setattr(proxy, "PROXY_API_KEY", "secret")
+    with _client() as c:
+        r = c.post("/v1/messages/count_tokens", json={"messages": []})
+    assert r.status_code == 401
+    assert r.json()["error"]["type"] == "authentication_error"

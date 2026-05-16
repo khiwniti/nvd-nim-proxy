@@ -1,31 +1,33 @@
 #!/usr/bin/env python3
 """nim — production CLI for the NVIDIA NIM ↔ Claude Code proxy."""
+
 from __future__ import annotations
 
 import argparse
 import copy
+import json
 import os
 import signal
 import socket
 import subprocess
 import sys
 import time
-import json
 from pathlib import Path
 
 import httpx
 import yaml
+from rich import box
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
-from rich import box
 
 console = Console()
 err_console = Console(stderr=True)
 
 
 # ─── Config directory ────────────────────────────────────────────────────────
+
 
 def config_dir() -> Path:
     base = Path(os.environ.get("APPDIR", Path.home() / ".config"))
@@ -47,6 +49,7 @@ def log_path() -> Path:
 
 
 # ─── Config loading ───────────────────────────────────────────────────────────
+
 
 def load_env(env_file: Path | None = None) -> None:
     candidates = [env_file] if env_file else [Path(".env"), config_dir() / ".env"]
@@ -94,9 +97,8 @@ def get_proxy_port(config: dict) -> int:
 
 def get_default_model(config: dict) -> str:
     nvidia = config.get("nvidia", {})
-    return (
-        os.environ.get("DEFAULT_NVIDIA_MODEL")
-        or nvidia.get("default_model", "nvidia/llama-3.3-nemotron-super-49b-v1.5")
+    return os.environ.get("DEFAULT_NVIDIA_MODEL") or nvidia.get(
+        "default_model", "nvidia/llama-3.3-nemotron-super-49b-v1.5"
     )
 
 
@@ -111,18 +113,17 @@ def get_tier_models(config: dict) -> tuple[str, str, str]:
     """
     nvidia = config.get("nvidia", {})
     sonnet = get_default_model(config)
-    opus = (
-        os.environ.get("OPUS_NVIDIA_MODEL")
-        or nvidia.get("opus_model", "deepseek-ai/deepseek-v4-pro")
+    opus = os.environ.get("OPUS_NVIDIA_MODEL") or nvidia.get(
+        "opus_model", "deepseek-ai/deepseek-v4-pro"
     )
-    haiku = (
-        os.environ.get("HAIKU_NVIDIA_MODEL")
-        or nvidia.get("haiku_model", "minimaxai/minimax-m2.7")
+    haiku = os.environ.get("HAIKU_NVIDIA_MODEL") or nvidia.get(
+        "haiku_model", "minimaxai/minimax-m2.7"
     )
     return opus, sonnet, haiku
 
 
 # ─── PID / process helpers ───────────────────────────────────────────────────
+
 
 def read_pid() -> int | None:
     p = pid_path()
@@ -164,6 +165,7 @@ def is_port_in_use(port: int) -> bool:
 
 
 # ─── Proxy lifecycle ─────────────────────────────────────────────────────────
+
 
 def wait_for_proxy(url: str, timeout: int = 15) -> bool:
     deadline = time.time() + timeout
@@ -240,7 +242,9 @@ DIM = "dim white"
 WARN = "yellow"
 ERR = "red"
 
-NIM_LOGO = "[bold cyan]NIM[/bold cyan] [dim]▸[/dim] [bold white]NVIDIA NIM Proxy[/bold white]"
+NIM_LOGO = (
+    "[bold cyan]NIM[/bold cyan] [dim]▸[/dim] [bold white]NVIDIA NIM Proxy[/bold white]"
+)
 
 
 def _pass(label: str, detail: str = "") -> None:
@@ -280,10 +284,16 @@ def _env_panel(url: str) -> Panel:
     body.append("ANTHROPIC_API_KEY", style="bold cyan")
     body.append("=", style=DIM)
     body.append("not-used", style="bright_white")
-    return Panel(body, title="[dim]Claude Code env vars[/dim]", border_style="dim cyan", padding=(0, 1))
+    return Panel(
+        body,
+        title="[dim]Claude Code env vars[/dim]",
+        border_style="dim cyan",
+        padding=(0, 1),
+    )
 
 
 # ─── Commands ────────────────────────────────────────────────────────────────
+
 
 def cmd_start(args: argparse.Namespace) -> None:
     config = load_config()
@@ -292,18 +302,26 @@ def cmd_start(args: argparse.Namespace) -> None:
 
     if ok and msg.startswith("already:"):
         _, pid, url = msg.split(":", 2)
-        console.print(f"\n[yellow]●[/yellow] Already running  [dim]PID {pid}[/dim]  [cyan]{url}[/cyan]\n")
+        console.print(
+            f"\n[yellow]●[/yellow] Already running  [dim]PID {pid}[/dim]  [cyan]{url}[/cyan]\n"
+        )
         console.print(_env_panel(url))
         console.print()
     elif ok and msg.startswith("started:"):
         _, pid, url = msg.split(":", 2)
-        console.print(f"\n[bold green]●[/bold green] Proxy started  [dim]PID {pid}[/dim]  [cyan]{url}[/cyan]\n")
+        console.print(
+            f"\n[bold green]●[/bold green] Proxy started  [dim]PID {pid}[/dim]  [cyan]{url}[/cyan]\n"
+        )
         console.print(_env_panel(url))
         console.print()
     elif not ok and msg.startswith("port:"):
         port = msg.split(":")[1]
-        console.print(f"\n[red]✗[/red] Port [bold]{port}[/bold] is already in use by another process.")
-        console.print(f"  [dim]Fix:[/dim] change [cyan]server.port[/cyan] with [white]nim configure server.port <port>[/white]")
+        console.print(
+            f"\n[red]✗[/red] Port [bold]{port}[/bold] is already in use by another process."
+        )
+        console.print(
+            f"  [dim]Fix:[/dim] change [cyan]server.port[/cyan] with [white]nim configure server.port <port>[/white]"
+        )
         console.print()
         sys.exit(1)
     elif not ok and msg == "timeout":
@@ -327,7 +345,9 @@ def cmd_stop(args: argparse.Namespace) -> None:
         console.print(f"\n[green]●[/green] Proxy stopped  [dim]PID {pid}[/dim]\n")
     elif ok and msg.startswith("killed:"):
         pid = msg.split(":")[1]
-        console.print(f"\n[yellow]●[/yellow] Proxy force-killed  [dim]PID {pid}[/dim]\n")
+        console.print(
+            f"\n[yellow]●[/yellow] Proxy force-killed  [dim]PID {pid}[/dim]\n"
+        )
     else:
         console.print(f"\n[red]✗[/red] {msg}\n")
         sys.exit(1)
@@ -343,7 +363,9 @@ def cmd_restart(args: argparse.Namespace) -> None:
 
     if ok and (msg.startswith("started:") or msg.startswith("already:")):
         _, pid, url = msg.split(":", 2)
-        console.print(f"[bold green]●[/bold green] Proxy running  [dim]PID {pid}[/dim]  [cyan]{url}[/cyan]\n")
+        console.print(
+            f"[bold green]●[/bold green] Proxy running  [dim]PID {pid}[/dim]  [cyan]{url}[/cyan]\n"
+        )
     else:
         console.print(f"[red]✗[/red] {msg}\n")
         sys.exit(1)
@@ -352,7 +374,9 @@ def cmd_restart(args: argparse.Namespace) -> None:
 def cmd_logs(args: argparse.Namespace) -> None:
     lp = log_path()
     if not lp.exists():
-        console.print("\n[dim]No log file found. Start the proxy first:[/dim] [white]nim start[/white]\n")
+        console.print(
+            "\n[dim]No log file found. Start the proxy first:[/dim] [white]nim start[/white]\n"
+        )
         return
 
     n = getattr(args, "lines", 50) or 50
@@ -407,14 +431,22 @@ def cmd_status(args: argparse.Namespace) -> None:
     table.add_row("Model", f"[dim]{get_default_model(config)}[/dim]")
 
     key_set = bool(os.environ.get("NVIDIA_API_KEY"))
-    table.add_row("API Key", "[green]● set[/green]" if key_set else "[red]✗ NOT SET[/red]")
+    table.add_row(
+        "API Key", "[green]● set[/green]" if key_set else "[red]✗ NOT SET[/red]"
+    )
 
     if alive:
-        table.add_row("Daemon", f"[bold green]● running[/bold green]  [dim]PID {pid}[/dim]")
+        table.add_row(
+            "Daemon", f"[bold green]● running[/bold green]  [dim]PID {pid}[/dim]"
+        )
         try:
             with httpx.Client(trust_env=False) as client:
                 r = client.get(f"{url}/healthz", timeout=2.0)
-                health = "[green]● OK[/green]" if r.status_code == 200 else f"[yellow]⚠ {r.status_code}[/yellow]"
+                health = (
+                    "[green]● OK[/green]"
+                    if r.status_code == 200
+                    else f"[yellow]⚠ {r.status_code}[/yellow]"
+                )
         except Exception:
             health = "[red]✗ unreachable[/red]"
         table.add_row("Health", health)
@@ -426,12 +458,14 @@ def cmd_status(args: argparse.Namespace) -> None:
 
 def cmd_init(args: argparse.Namespace) -> None:
     console.print()
-    console.print(Panel(
-        "[bold]Get a FREE key at:[/bold] [cyan underline]https://build.nvidia.com[/cyan underline]",
-        title=f"{NIM_LOGO}  [dim]Setup Wizard[/dim]",
-        border_style="cyan",
-        padding=(1, 2),
-    ))
+    console.print(
+        Panel(
+            "[bold]Get a FREE key at:[/bold] [cyan underline]https://build.nvidia.com[/cyan underline]",
+            title=f"{NIM_LOGO}  [dim]Setup Wizard[/dim]",
+            border_style="cyan",
+            padding=(1, 2),
+        )
+    )
     console.print()
 
     api_key = console.input("[cyan]🔑 NVIDIA_API_KEY[/cyan] › ").strip()
@@ -456,7 +490,9 @@ def cmd_init(args: argparse.Namespace) -> None:
     console.print()
     console.print(_env_panel(proxy_url))
     console.print()
-    console.print("[dim]Next step:[/dim]  [bold white]nim start[/bold white]   [dim]then[/dim]   [bold white]nim code[/bold white]")
+    console.print(
+        "[dim]Next step:[/dim]  [bold white]nim start[/bold white]   [dim]then[/dim]   [bold white]nim code[/bold white]"
+    )
     console.print()
 
 
@@ -562,7 +598,14 @@ def cmd_configure(args: argparse.Namespace) -> None:
 
         if display:
             _flatten(display)
-            console.print(Panel(table, title=f"[dim]{global_config_path()}[/dim]", border_style="dim cyan", padding=(0, 1)))
+            console.print(
+                Panel(
+                    table,
+                    title=f"[dim]{global_config_path()}[/dim]",
+                    border_style="dim cyan",
+                    padding=(0, 1),
+                )
+            )
         else:
             console.print(f"\n[dim](empty — {global_config_path()})[/dim]\n")
         return
@@ -588,7 +631,9 @@ def cmd_configure(args: argparse.Namespace) -> None:
 
     node[parts[-1]] = coerced
     save_config(cfg)
-    console.print(f"\n[green]✓[/green] [cyan]{key_path}[/cyan] = [white]{coerced!r}[/white]  [dim]({global_config_path()})[/dim]\n")
+    console.print(
+        f"\n[green]✓[/green] [cyan]{key_path}[/cyan] = [white]{coerced!r}[/white]  [dim]({global_config_path()})[/dim]\n"
+    )
 
 
 def cmd_models(args: argparse.Namespace) -> None:
@@ -597,7 +642,9 @@ def cmd_models(args: argparse.Namespace) -> None:
     alive, _ = is_running()
 
     if not alive:
-        console.print("\n[red]✗[/red] Proxy is not running. Start it first: [white]nim start[/white]\n")
+        console.print(
+            "\n[red]✗[/red] Proxy is not running. Start it first: [white]nim start[/white]\n"
+        )
         sys.exit(1)
 
     with console.status("[cyan]Fetching models…[/cyan]", spinner="dots"):
@@ -620,7 +667,14 @@ def cmd_models(args: argparse.Namespace) -> None:
         table.add_row(m["id"], m.get("object", "model"))
 
     console.print()
-    console.print(Panel(table, title=f"[dim]NVIDIA NIM Models via {url}[/dim]", border_style="dim cyan", padding=(0, 1)))
+    console.print(
+        Panel(
+            table,
+            title=f"[dim]NVIDIA NIM Models via {url}[/dim]",
+            border_style="dim cyan",
+            padding=(0, 1),
+        )
+    )
     console.print()
 
 
@@ -629,9 +683,13 @@ def cmd_use(args: argparse.Namespace) -> None:
 
     # Basic validation: NIM model IDs contain at least one "/"
     if "/" not in model:
-        console.print(f"\n[red]✗[/red] [bold]{model}[/bold] doesn't look like a NIM model ID.")
+        console.print(
+            f"\n[red]✗[/red] [bold]{model}[/bold] doesn't look like a NIM model ID."
+        )
         console.print("  Expected format: [cyan]<provider>/<model-name>[/cyan]")
-        console.print("  Examples: [white]qwen/qwen3-235b-a22b[/white]  [white]meta/llama-3.3-70b-instruct[/white]  [white]z-ai/glm-5.1[/white]\n")
+        console.print(
+            "  Examples: [white]qwen/qwen3-235b-a22b[/white]  [white]meta/llama-3.3-70b-instruct[/white]  [white]z-ai/glm-5.1[/white]\n"
+        )
         sys.exit(1)
 
     cfg = load_config()
@@ -643,7 +701,9 @@ def cmd_use(args: argparse.Namespace) -> None:
     alive, pid = is_running()
     restarted = False
     if alive:
-        with console.status("[cyan]Restarting proxy with new model…[/cyan]", spinner="dots"):
+        with console.status(
+            "[cyan]Restarting proxy with new model…[/cyan]", spinner="dots"
+        ):
             stop_daemon()
             time.sleep(0.4)
             ok, msg = start_daemon(cfg)
@@ -666,12 +726,14 @@ def cmd_use(args: argparse.Namespace) -> None:
         body.append("nim start", style="white")
         body.append(" to apply.", style="dim")
 
-    console.print(Panel(
-        body,
-        title="[bold green]✓ Active model updated[/bold green]",
-        border_style="green",
-        padding=(1, 2),
-    ))
+    console.print(
+        Panel(
+            body,
+            title="[bold green]✓ Active model updated[/bold green]",
+            border_style="green",
+            padding=(1, 2),
+        )
+    )
     console.print()
 
     # Print ready-to-paste one-liner
@@ -687,7 +749,9 @@ def cmd_test(args: argparse.Namespace) -> None:
     model = getattr(args, "model", None) or get_default_model(config)
     prompt = getattr(args, "prompt", None) or "Say 'proxy OK' in exactly 3 words."
 
-    console.print(f"\n[dim]Sending test →[/dim] [cyan]{url}[/cyan]  [dim]model:[/dim] [white]{model}[/white]")
+    console.print(
+        f"\n[dim]Sending test →[/dim] [cyan]{url}[/cyan]  [dim]model:[/dim] [white]{model}[/white]"
+    )
 
     payload = {
         "model": model,
@@ -714,16 +778,30 @@ def cmd_test(args: argparse.Namespace) -> None:
         result_text = Text()
         result_text.append(text + "\n\n", style="bold white")
         result_text.append(
-            f"status: 200 OK   in: {usage.get('input_tokens','?')} tok   out: {usage.get('output_tokens','?')} tok",
+            f"status: 200 OK   in: {usage.get('input_tokens', '?')} tok   out: {usage.get('output_tokens', '?')} tok",
             style="dim",
         )
         console.print()
-        console.print(Panel(result_text, title="[green]✓ Test passed[/green]", border_style="green", padding=(1, 2)))
+        console.print(
+            Panel(
+                result_text,
+                title="[green]✓ Test passed[/green]",
+                border_style="green",
+                padding=(1, 2),
+            )
+        )
         console.print()
     else:
         err_text = resp.text[:300]
         console.print()
-        console.print(Panel(err_text, title=f"[red]✗ Error {resp.status_code}[/red]", border_style="red", padding=(1, 2)))
+        console.print(
+            Panel(
+                err_text,
+                title=f"[red]✗ Error {resp.status_code}[/red]",
+                border_style="red",
+                padding=(1, 2),
+            )
+        )
         console.print()
         sys.exit(1)
 
@@ -731,37 +809,86 @@ def cmd_test(args: argparse.Namespace) -> None:
 # ─── Curated flagship model catalogue ────────────────────────────────────────
 
 FLAGSHIP_MODELS: list[dict] = [
-    {"p": "NVIDIA",    "id": "nvidia/llama-3.3-nemotron-super-49b-v1.5",    "desc": "best balance · tools"},
-    {"p": "NVIDIA",    "id": "nvidia/llama-3.1-nemotron-ultra-253b-v1",      "desc": "strongest reasoning"},
-    {"p": "DeepSeek",  "id": "deepseek-ai/deepseek-v4-pro",                  "desc": "flagship · deep reasoning"},
-    {"p": "DeepSeek",  "id": "deepseek-ai/deepseek-v4-flash",                "desc": "fast · low latency"},
-    {"p": "Qwen",      "id": "qwen/qwen3.5-397b-a17b",                       "desc": "397B · largest Qwen"},
-    {"p": "Qwen",      "id": "qwen/qwen3-coder-480b-a35b-instruct",          "desc": "480B MoE · best coder"},
-    {"p": "Meta",      "id": "meta/llama-4-maverick-17b-128e-instruct",      "desc": "vision + tools · Llama 4"},
-    {"p": "Meta",      "id": "meta/llama-3.3-70b-instruct",                  "desc": "general purpose"},
-    {"p": "Mistral",   "id": "mistralai/mistral-large-3-675b-instruct-2512", "desc": "675B · largest Mistral"},
-    {"p": "Mistral",   "id": "mistralai/mistral-medium-3.5-128b",            "desc": "balanced · fast"},
-    {"p": "Z-AI",      "id": "z-ai/glm-5.1",                                 "desc": "GLM flagship"},
-    {"p": "Z-AI",      "id": "z-ai/glm5",                                    "desc": "latest GLM"},
-    {"p": "MiniMax",   "id": "minimaxai/minimax-m2.7",                       "desc": "MiniMax flagship"},
-    {"p": "Moonshot",  "id": "moonshotai/kimi-k2.6",                        "desc": "Kimi flagship"},
-    {"p": "Microsoft", "id": "microsoft/phi-4-multimodal-instruct",          "desc": "multimodal · efficient"},
-    {"p": "Google",    "id": "google/gemma-4-31b-it",                        "desc": "Gemma 4 · instruction-tuned"},
-    {"p": "OpenAI",    "id": "openai/gpt-oss-120b",                          "desc": "GPT OSS 120B"},
-    {"p": "ByteDance", "id": "bytedance/seed-oss-36b-instruct",              "desc": "Seed OSS"},
-    {"p": "StepFun",   "id": "stepfun-ai/step-3.5-flash",                   "desc": "fast · step flash"},
-    {"p": "Writer",    "id": "writer/palmyra-creative-122b",                 "desc": "creative writing 122B"},
+    {
+        "p": "NVIDIA",
+        "id": "nvidia/llama-3.3-nemotron-super-49b-v1.5",
+        "desc": "best balance · tools",
+    },
+    {
+        "p": "NVIDIA",
+        "id": "nvidia/llama-3.1-nemotron-ultra-253b-v1",
+        "desc": "strongest reasoning",
+    },
+    {
+        "p": "DeepSeek",
+        "id": "deepseek-ai/deepseek-v4-pro",
+        "desc": "flagship · deep reasoning",
+    },
+    {
+        "p": "DeepSeek",
+        "id": "deepseek-ai/deepseek-v4-flash",
+        "desc": "fast · low latency",
+    },
+    {"p": "Qwen", "id": "qwen/qwen3.5-397b-a17b", "desc": "397B · largest Qwen"},
+    {
+        "p": "Qwen",
+        "id": "qwen/qwen3-coder-480b-a35b-instruct",
+        "desc": "480B MoE · best coder",
+    },
+    {
+        "p": "Meta",
+        "id": "meta/llama-4-maverick-17b-128e-instruct",
+        "desc": "vision + tools · Llama 4",
+    },
+    {"p": "Meta", "id": "meta/llama-3.3-70b-instruct", "desc": "general purpose"},
+    {
+        "p": "Mistral",
+        "id": "mistralai/mistral-large-3-675b-instruct-2512",
+        "desc": "675B · largest Mistral",
+    },
+    {
+        "p": "Mistral",
+        "id": "mistralai/mistral-medium-3.5-128b",
+        "desc": "balanced · fast",
+    },
+    {"p": "Z-AI", "id": "z-ai/glm-5.1", "desc": "GLM flagship"},
+    {"p": "Z-AI", "id": "z-ai/glm5", "desc": "latest GLM"},
+    {"p": "MiniMax", "id": "minimaxai/minimax-m2.7", "desc": "MiniMax flagship"},
+    {"p": "Moonshot", "id": "moonshotai/kimi-k2.6", "desc": "Kimi flagship"},
+    {
+        "p": "Microsoft",
+        "id": "microsoft/phi-4-multimodal-instruct",
+        "desc": "multimodal · efficient",
+    },
+    {
+        "p": "Google",
+        "id": "google/gemma-4-31b-it",
+        "desc": "Gemma 4 · instruction-tuned",
+    },
+    {"p": "OpenAI", "id": "openai/gpt-oss-120b", "desc": "GPT OSS 120B"},
+    {"p": "ByteDance", "id": "bytedance/seed-oss-36b-instruct", "desc": "Seed OSS"},
+    {"p": "StepFun", "id": "stepfun-ai/step-3.5-flash", "desc": "fast · step flash"},
+    {
+        "p": "Writer",
+        "id": "writer/palmyra-creative-122b",
+        "desc": "creative writing 122B",
+    },
 ]
 
 
 def pick_model_interactive(default_model: str) -> str:
     """Render a numbered flagship list; return the chosen model ID."""
-    t = Table(box=box.SIMPLE, show_header=True, header_style="bold cyan",
-              pad_edge=False, show_edge=False)
-    t.add_column("#",        style="dim", width=3, justify="right")
+    t = Table(
+        box=box.SIMPLE,
+        show_header=True,
+        header_style="bold cyan",
+        pad_edge=False,
+        show_edge=False,
+    )
+    t.add_column("#", style="dim", width=3, justify="right")
     t.add_column("Provider", style="bold", min_width=10)
-    t.add_column("Model",    style="cyan", min_width=44)
-    t.add_column("Notes",    style="dim")
+    t.add_column("Model", style="cyan", min_width=44)
+    t.add_column("Notes", style="dim")
 
     prev_provider = ""
     for i, m in enumerate(FLAGSHIP_MODELS, 1):
@@ -773,12 +900,15 @@ def pick_model_interactive(default_model: str) -> str:
         prev_provider = m["p"]
 
     console.print()
-    console.print(Panel(
-        t,
-        title="[bold cyan]Select a model[/bold cyan]",
-        subtitle="[dim]any model ID from build.nvidia.com also works[/dim]",
-        border_style="cyan", padding=(1, 2),
-    ))
+    console.print(
+        Panel(
+            t,
+            title="[bold cyan]Select a model[/bold cyan]",
+            subtitle="[dim]any model ID from build.nvidia.com also works[/dim]",
+            border_style="cyan",
+            padding=(1, 2),
+        )
+    )
     console.print(
         f"[dim]Number, model ID, or Enter for default "
         f"([cyan]{default_model}[/cyan])[/dim]: ",
@@ -819,7 +949,9 @@ def cmd_code(args: argparse.Namespace) -> None:
         console.print(f"\n[dim]● Reusing proxy[/dim]  PID {pid}  [cyan]{url}[/cyan]")
     else:
         console.print("\n[cyan]●[/cyan] Starting proxy daemon…")
-        with console.status("[cyan]Waiting for proxy to be ready…[/cyan]", spinner="dots"):
+        with console.status(
+            "[cyan]Waiting for proxy to be ready…[/cyan]", spinner="dots"
+        ):
             ok, msg = start_daemon(config)
         if not ok:
             if msg.startswith("port:"):
@@ -828,10 +960,15 @@ def cmd_code(args: argparse.Namespace) -> None:
                 console.print(f"[red]✗[/red] {msg}")
             sys.exit(1)
         _, pid, url = msg.split(":", 2)
-        console.print(f"[green]●[/green] Proxy ready  [dim]PID {pid}[/dim]  [cyan]{url}[/cyan]")
+        console.print(
+            f"[green]●[/green] Proxy ready  [dim]PID {pid}[/dim]  [cyan]{url}[/cyan]"
+        )
 
     console.print()
-    console.rule(f"[bold cyan]NIM[/bold cyan]  [dim]{model}[/dim]  [dim]→[/dim]  [cyan]{url}[/cyan]", style="dim cyan")
+    console.rule(
+        f"[bold cyan]NIM[/bold cyan]  [dim]{model}[/dim]  [dim]→[/dim]  [cyan]{url}[/cyan]",
+        style="dim cyan",
+    )
     console.print()
 
     opus_model, sonnet_model, haiku_model = get_tier_models(config)
@@ -844,39 +981,57 @@ def cmd_code(args: argparse.Namespace) -> None:
     env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = opus_model
     env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = sonnet_model
     env["CLAUDE_CODE_SUBAGENT_MODEL"] = haiku_model
+    # Claude Code gateway alignment: expose gateway models, avoid Anthropic-only
+    # beta/tool-reference/thinking paths that NVIDIA's OpenAI-compatible API
+    # cannot consume, and let the proxy handle any upstream reasoning text.
+    env["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] = "1"
     env["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"] = "1"
+    env["ENABLE_TOOL_SEARCH"] = "false"
+    env["CLAUDE_CODE_DISABLE_THINKING"] = "1"
+    env["DISABLE_INTERLEAVED_THINKING"] = "1"
 
     try:
         subprocess.run(["claude"] + (args.claude_args or []), env=env, check=False)
     except FileNotFoundError:
-        console.print("\n[red]✗[/red] [bold]claude[/bold] not found. Install Claude Code: [cyan underline]https://claude.ai/code[/cyan underline]\n")
+        console.print(
+            "\n[red]✗[/red] [bold]claude[/bold] not found. Install Claude Code: [cyan underline]https://claude.ai/code[/cyan underline]\n"
+        )
         sys.exit(1)
 
     console.print()
-    console.rule("[dim]Claude Code session ended — proxy still running[/dim]", style="dim")
+    console.rule(
+        "[dim]Claude Code session ended — proxy still running[/dim]", style="dim"
+    )
     console.print(f"[dim]  Stop with:[/dim] [white]nim stop[/white]\n")
 
 
 def cmd_proxy(args: argparse.Namespace) -> None:
     from proxy import main as proxy_main
+
     proxy_main()
 
 
 def cmd_version(args: argparse.Namespace) -> None:
     try:
         from importlib.metadata import version
-        v = version("nvd-claude-nim")
+
+        v = version("nim-claude-proxy")
     except Exception:
         try:
             import tomllib
         except ImportError:
             import tomli as tomllib  # type: ignore[no-redef]
         p = Path(__file__).parent / "pyproject.toml"
-        v = tomllib.loads(p.read_text())["project"]["version"] if p.exists() else "unknown"
-    console.print(f"[bold cyan]nvd-claude-nim[/bold cyan] [white]{v}[/white]")
+        v = (
+            tomllib.loads(p.read_text())["project"]["version"]
+            if p.exists()
+            else "unknown"
+        )
+    console.print(f"[bold cyan]nim-claude-proxy[/bold cyan] [white]{v}[/white]")
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
+
 
 def main() -> None:
     load_env()
@@ -892,28 +1047,42 @@ def main() -> None:
     sub.add_parser("restart", help="Restart daemon")
 
     logs_p = sub.add_parser("logs", help="Show proxy logs")
-    logs_p.add_argument("-f", "--follow", action="store_true", help="Tail log in real time")
-    logs_p.add_argument("-n", "--lines", type=int, default=50, help="Number of lines (default 50)")
+    logs_p.add_argument(
+        "-f", "--follow", action="store_true", help="Tail log in real time"
+    )
+    logs_p.add_argument(
+        "-n", "--lines", type=int, default=50, help="Number of lines (default 50)"
+    )
 
     sub.add_parser("status", help="Show proxy status")
     sub.add_parser("init", help="Interactive setup wizard")
     sub.add_parser("doctor", help="Diagnose configuration problems")
 
     cfg_p = sub.add_parser("configure", help="Set or list config values")
-    cfg_p.add_argument("key", nargs="?", help="Dot-notation config key (e.g. server.port)")
+    cfg_p.add_argument(
+        "key", nargs="?", help="Dot-notation config key (e.g. server.port)"
+    )
     cfg_p.add_argument("value", nargs="?", help="Value to set")
     cfg_p.add_argument("--list", action="store_true", help="Print effective config")
 
-    sub.add_parser("models", help="List available NVIDIA models (proxy must be running)")
+    sub.add_parser(
+        "models", help="List available NVIDIA models (proxy must be running)"
+    )
 
-    use_p = sub.add_parser("use", help="Switch active model (e.g. nim use qwen/qwen3-235b-a22b)")
-    use_p.add_argument("model", help="NIM model ID — any provider/model from build.nvidia.com")
+    use_p = sub.add_parser(
+        "use", help="Switch active model (e.g. nim use qwen/qwen3-235b-a22b)"
+    )
+    use_p.add_argument(
+        "model", help="NIM model ID — any provider/model from build.nvidia.com"
+    )
 
     test_p = sub.add_parser("test", help="Send a test request through the proxy")
     test_p.add_argument("prompt", nargs="?", help="Custom test prompt")
     test_p.add_argument("--model", help="Override model")
 
-    code_p = sub.add_parser("code", help="Start proxy (if needed) then launch Claude Code")
+    code_p = sub.add_parser(
+        "code", help="Start proxy (if needed) then launch Claude Code"
+    )
     code_p.add_argument("--model", help="Override model")
     code_p.add_argument("claude_args", nargs="*", help="Extra args forwarded to claude")
 

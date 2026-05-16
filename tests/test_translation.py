@@ -23,7 +23,10 @@ def test_translate_request_maps_model_and_system_and_tool():
             {
                 "name": "read_file",
                 "description": "Read a file",
-                "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}},
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                },
             },
             {"type": "web_search_20250305", "name": "web_search"},
         ],
@@ -48,7 +51,11 @@ def test_translate_tool_result_message_to_openai_tool_message():
             "role": "user",
             "content": [
                 {"type": "text", "text": "result:"},
-                {"type": "tool_result", "tool_use_id": "toolu_abc", "content": [{"type": "text", "text": "42"}]},
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_abc",
+                    "content": [{"type": "text", "text": "42"}],
+                },
             ],
         }
     ]
@@ -68,7 +75,10 @@ def test_translate_response_tool_call_to_anthropic_tool_use():
                         {
                             "id": "call_123",
                             "type": "function",
-                            "function": {"name": "read_file", "arguments": json.dumps({"path": "README.md"})},
+                            "function": {
+                                "name": "read_file",
+                                "arguments": json.dumps({"path": "README.md"}),
+                            },
                         }
                     ],
                 },
@@ -122,7 +132,19 @@ def test_context_safe_max_tokens_parses_nvidia_overflow():
         "in a maximum input length of 186368 tokens."
     )
     safe = proxy._context_safe_max_tokens(msg)
-    assert safe == 202752 - 186369 - 1  # == 16382
+    assert safe == 202752 - 186369 - proxy.CONTEXT_SAFETY_MARGIN
+
+
+def test_context_safe_max_tokens_parses_multiline_prompt_overflow():
+    msg = (
+        "API Error: 400 This model's maximum context length is 131072 tokens.\n"
+        "However, you requested 16382 output tokens and your prompt contains at\n"
+        "least 114691 input tokens."
+    )
+    assert (
+        proxy._context_safe_max_tokens(msg)
+        == 131072 - 114691 - proxy.CONTEXT_SAFETY_MARGIN
+    )
 
 
 def test_context_safe_max_tokens_returns_none_for_unrelated_error():

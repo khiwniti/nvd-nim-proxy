@@ -17,6 +17,11 @@ env/
 !.env.example
 config.yaml
 
+# Node / Cloudflare Workers
+node_modules/
+.wrangler/
+dist/
+
 # OS/editor noise
 .DS_Store
 .idea/
