@@ -12,7 +12,7 @@ mode = "smart"
 class_name = "NimProxyContainer"
 image = "../Dockerfile"
 max_instances = 3
-instance_type = "standard"
+instance_type = "standard-1"
 rollout_step_percentage = 25
 rollout_kind = "full_auto"
 

@@ -19,7 +19,7 @@ max_instances = 3
 # "standard" gives 1 vCPU / 512 MB RAM vs "basic" 0.5 vCPU / 256 MB.
 # The Python proxy is I/O-bound but benefits from the extra memory headroom
 # when handling large tool-call payloads from Claude Code.
-instance_type = "standard"
+instance_type = "standard-1"
 # Gradual rollout: shift 25 % of traffic per step so a bad deploy doesn't
 # immediately affect all users.
 rollout_step_percentage = 25
