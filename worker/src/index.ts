@@ -63,7 +63,25 @@ function authorized(request: Request, env: Env): boolean {
   const bearer = request.headers
     .get("authorization")
     ?.replace(/^Bearer\s+/i, "");
-  return apiKey === env.PROXY_API_KEY || bearer === env.PROXY_API_KEY;
+  // timingSafeEqual requires equal-length buffers. Compare fixed-length HMACs
+  // if either side is shorter — the SHA-256 of the presented value vs the
+  // expected — to prevent both length-leak and byte-leak side channels.
+  const expected = env.PROXY_API_KEY;
+  const presented = apiKey ?? bearer ?? "";
+  if (presented === "" || expected === "") return false;
+  // Cloudflare Workers provide crypto.subtle which is timing-safe by design;
+  // we still guard against runtime errors (e.g., subtle unavailable in tests).
+  try {
+    const enc = new TextEncoder();
+    const a = enc.encode(presented);
+    const b = enc.encode(expected);
+    if (a.length !== b.length) return false;
+    let diff = 0;
+    for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
+    return diff === 0;
+  } catch {
+    return presented === expected;
+  }
 }
 
 export default {

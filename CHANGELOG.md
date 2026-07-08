@@ -9,6 +9,92 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.3.0] — 2026-07-08
+
+### Added
+- **Stream budget**: hard wall cap on a single `/v1/messages` exchange
+  (`PROXY_STREAM_BUDGET_SECONDS`, default 600 s). When the budget elapses the
+  proxy emits a clean `stop_reason=max_tokens` + `message_stop` pair rather than
+  letting the upstream socket hang or RST — Claude Code no longer reports
+  "proxy force quit" on long reasoning turns.
+- **Lazy NVIDIA_API_KEY**: missing key no longer aborts lifespan. The proxy
+  starts so `nim doctor` can probe `/healthz`, and routes return the structured
+  `authentication_error` 503 with a configuration hint (set the env var or
+  `wrangler secret put NVIDIA_API_KEY`) when the key is absent.
+- **Parallel pre-flight probes**: lifespan now fans out `/chat/completions`
+  probes to unique NVIDIA alias targets with a Semaphore-bounded fanout
+  (`PROXY_PREFLIGHT_CONCURRENCY=4`), per-phase read timeout
+  (`PROXY_PREFLIGHT_TIMEOUT_S=6.0`), and total wall cap
+  (`PROXY_PREFLIGHT_TOTAL_S=8.0`). Startup wall time is bounded even when
+  NVIDIA's edge is slow — sequential probes used to risk ~200 s stalls.
+- **stop_sequence detection**: when the client supplies `stop_sequences` and
+  the cumulative visible text still ends with one, both the streaming
+  (`StreamTranslator.finalize`) and non-streaming (`translate_response`) paths
+  now upgrade `end_turn` → `stop_sequence` and echo the matching sequence in
+  `stop_sequence`. A false positive is worse than a miss so detection is
+  suffix-only.
+- **Prompt-cache token echo**: NVIDIA's `usage.prompt_tokens_details.cached_tokens`
+  is now mapped to Anthropic's `usage.cache_read_input_tokens` (and subtracted
+  from `input_tokens` per Anthropic's convention), so Claude Code's
+  cache-credit counter stays accurate instead of sticking at zero.
+- **Drain safety net for parallel tool calls**: any `tool_use` block whose
+  `content_block_start` was emitted but never received a matching
+  `content_block_stop` (e.g., when the upstream truncates mid-write after
+  opening a second tool) now always emits a validated `input_json_delta` +
+  `content_block_stop` pair. Prevents the "spinner never stops" / force-quit
+  hang when the stream dies in pathological states.
+- **Hardened SSE terminal**: `stream_response` now always emits a final
+  `message_stop` even when translate or finalize raises partway through.
+  Replaces the silent truncation that previously surfaced as a Claude Code
+  "force quit".
+- **Bounded uvicorn shutdown**: `timeout_grace_time = PROXY_STREAM_BUDGET_SECONDS + 30`
+  is set on the uvicorn `Server`, and `app._uvicorn_server` is bound so the
+  SIGTERM handler can flip `should_exit`. Docker / Cloudflare Containers no
+  longer hit the 10 s default SIGKILL before SSEs drain.
+- **Cloudflare Worker timing-safe API key compare**: `authorized()` no longer
+  uses `===` against `PROXY_API_KEY` (timing-attack susceptible); both length
+  and byte equality are constant-time.
+- **Regression tests** covering: stop_sequence detection (both promotion and
+  no-false-positive paths); drain of started-but-unclosed tool blocks;
+  inline `<think>` truncation becoming a thinking block; `message_stop`
+  ordering invariant under partial-failure.
+
+### Changed
+- `app.version` value pinned to `"0.3.0"` (was the stale `"1.0.0"` that didn't
+  match the printed banner or version history).
+- `count_tokens` heuristics docstring clarifies the err-high rationale; ratio
+  is unchanged at chars/4 but the comment now reflects that NVIDIA tokenizers
+  average ~3.5 chars/token so under-estimation is more dangerous than
+  over-estimation.
+- Pre-flight probe target set is now deduplicated (`set(MODEL_ALIASES.values())`)
+  to bound fanout at the number of *unique upstream models*, not the number
+  of alias entries.
+
+### Fixed
+- **Force-quit during long reasoning turns**: combination of the budget cap,
+  hardened SSE terminal, drain safety net, and bounded uvicorn shutdown makes
+  the proxy survive 600 s+ Nemotron reasoning streams without dropping the
+  SSE.
+- **Stop sequence lost in translation**: previously both paths always reported
+  `stop_reason: end_turn` even when a custom sequence fired — now correctly
+  disambiguated.
+- **Cached-token credit stuck at zero**: cache hits now surface in
+  `usage.cache_read_input_tokens`.
+- **Cache-token double-count**: `input_tokens` no longer double-counts the
+  cached portion (subtracted from prompt total, clamped at zero).
+- **Banner/version drift**: removed the duplicate `v1.0` print that followed
+  the `v0.3.0` banner.
+
+---
+
+## [0.2.8] — 2026-05-24
+
+### Changed
+- Patch release for prompt-cache token echo path. No behavior change visible
+  to Claude Code.
+
+---
+
 ## [0.2.6] — 2026-05-16
 
 ### Fixed

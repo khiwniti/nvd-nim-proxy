@@ -926,16 +926,28 @@ def cmd_test(args: argparse.Namespace) -> None:
 # ─── Curated flagship model catalogue ────────────────────────────────────────
 
 FLAGSHIP_MODELS: list[dict] = [
+    # ── NVIDIA Nemotron (default recommendation) ──
     {
         "p": "NVIDIA",
         "id": "nvidia/llama-3.3-nemotron-super-49b-v1.5",
-        "desc": "best balance · tools",
+        "desc": "best balance · tools · default",
     },
     {
         "p": "NVIDIA",
         "id": "nvidia/llama-3.1-nemotron-ultra-253b-v1",
-        "desc": "strongest reasoning",
+        "desc": "strongest Nemotron · 253B",
     },
+    {
+        "p": "NVIDIA",
+        "id": "nvidia/llama-3.1-nemotron-70b-instruct",
+        "desc": "Nemotron 70B · fast",
+    },
+    {
+        "p": "NVIDIA",
+        "id": "nvidia/llama-3.1-nemotron-nano-8b-v1",
+        "desc": "Nemotron Nano · ultra-low latency",
+    },
+    # ── DeepSeek ──
     {
         "p": "DeepSeek",
         "id": "deepseek-ai/deepseek-v4-pro",
@@ -946,18 +958,39 @@ FLAGSHIP_MODELS: list[dict] = [
         "id": "deepseek-ai/deepseek-v4-flash",
         "desc": "fast · low latency",
     },
-    {"p": "Qwen", "id": "qwen/qwen3.5-397b-a17b", "desc": "397B · largest Qwen"},
+    # ── Qwen ──
+    {
+        "p": "Qwen",
+        "id": "qwen/qwen3.5-397b-a17b",
+        "desc": "397B · largest Qwen",
+    },
     {
         "p": "Qwen",
         "id": "qwen/qwen3-coder-480b-a35b-instruct",
         "desc": "480B MoE · best coder",
     },
     {
+        "p": "Qwen",
+        "id": "qwen/qwen3.5-122b-a10b",
+        "desc": "128k context · balanced",
+    },
+    # ── Meta Llama ──
+    {
         "p": "Meta",
         "id": "meta/llama-4-maverick-17b-128e-instruct",
         "desc": "vision + tools · Llama 4",
     },
-    {"p": "Meta", "id": "meta/llama-3.3-70b-instruct", "desc": "general purpose"},
+    {
+        "p": "Meta",
+        "id": "meta/llama-3.3-70b-instruct",
+        "desc": "general purpose · 70B",
+    },
+    {
+        "p": "Meta",
+        "id": "meta/llama-3.1-8b-instruct",
+        "desc": "ultra-fast · edge deployment",
+    },
+    # ── Mistral ──
     {
         "p": "Mistral",
         "id": "mistralai/mistral-large-3-675b-instruct-2512",
@@ -966,21 +999,33 @@ FLAGSHIP_MODELS: list[dict] = [
     {
         "p": "Mistral",
         "id": "mistralai/mistral-medium-3.5-128b",
-        "desc": "balanced · fast",
+        "desc": "balanced · 128B",
     },
-    {"p": "Z-AI", "id": "z-ai/glm-5.1", "desc": "GLM flagship"},
-    {"p": "Z-AI", "id": "z-ai/glm5", "desc": "latest GLM"},
-    {"p": "MiniMax", "id": "minimaxai/minimax-m2.7", "desc": "MiniMax flagship"},
-    {"p": "Moonshot", "id": "moonshotai/kimi-k2.6", "desc": "Kimi flagship"},
     {
-        "p": "Microsoft",
-        "id": "microsoft/phi-4-multimodal-instruct",
-        "desc": "multimodal · efficient",
+        "p": "Mistral",
+        "id": "mistralai/mistral-large-2-instruct",
+        "desc": "Mistral Large v2 · 131k",
     },
+    # ── Google Gemma ──
     {
         "p": "Google",
         "id": "google/gemma-4-31b-it",
         "desc": "Gemma 4 · instruction-tuned",
+    },
+    {
+        "p": "Google",
+        "id": "google/gemma-3-12b-it",
+        "desc": "Gemma 3 · 12B · mobile",
+    },
+    # ── Other high-quality providers ──
+    {"p": "Z-AI", "id": "z-ai/glm-5.1", "desc": "GLM flagship · Chinese-English"},
+    {"p": "Z-AI", "id": "z-ai/glm5", "desc": "latest GLM"},
+    {"p": "MiniMax", "id": "minimaxai/minimax-m2.7", "desc": "MiniMax flagship"},
+    {"p": "Moonshot", "id": "moonshotai/kimi-k2.6", "desc": "Kimi flagship · 200k"},
+    {
+        "p": "Microsoft",
+        "id": "microsoft/phi-4-multimodal-instruct",
+        "desc": "multimodal · efficient",
     },
     {"p": "OpenAI", "id": "openai/gpt-oss-120b", "desc": "GPT OSS 120B"},
     {"p": "ByteDance", "id": "bytedance/seed-oss-36b-instruct", "desc": "Seed OSS"},
@@ -993,8 +1038,135 @@ FLAGSHIP_MODELS: list[dict] = [
 ]
 
 
-def pick_model_interactive(default_model: str) -> str:
-    """Render a numbered flagship list; return the chosen model ID."""
+def _extract_provider(model_id: str) -> str:
+    """Extract provider name from a model ID like 'nvidia/llama-...' -> 'NVIDIA'."""
+    if "/" not in model_id:
+        return ""
+    provider_part = model_id.split("/")[0]
+    # Capitalize nicely
+    if provider_part.lower() == "nvidia":
+        return "NVIDIA"
+    if provider_part.lower() == "meta":
+        return "Meta"
+    if provider_part.lower() == "mistralai":
+        return "Mistral"
+    if provider_part.lower() == "deepseek-ai":
+        return "DeepSeek"
+    if provider_part.lower().startswith("microsoft"):
+        return "Microsoft"
+    if provider_part.lower() == "bytedance":
+        return "ByteDance"
+    if provider_part.lower().startswith("minimax"):
+        return "MiniMax"
+    if provider_part.lower().startswith("moonshot"):
+        return "Moonshot"
+    if provider_part.lower().startswith("openai"):
+        return "OpenAI"
+    if provider_part.lower().startswith("google"):
+        return "Google"
+    if provider_part.lower().startswith("qwen"):
+        return "Qwen"
+    if provider_part.lower().startswith("stepfun"):
+        return "StepFun"
+    if provider_part.lower().startswith("writer"):
+        return "Writer"
+    return provider_part.replace("-", " ").title()
+
+
+def _build_model_display_list(live_models: list[str]) -> list[dict]:
+    """Merge live models with FLAGSHIP_MODELS for descriptions.
+
+    Result: each entry has 'provider', 'id', 'desc', 'is_live'.
+    Live models that appear in FLAGSHIP_MODELS get their description.
+    Live models not in FLAGSHIP_MODELS get an empty or inferred desc.
+    Flagship models not available show but are marked [unavailable].
+    """
+    live_set = set(live_models)
+    flagship_by_id = {m["id"]: m for m in FLAGSHIP_MODELS}
+
+    # Start with all live models + all flagship that are live
+    seen: set[str] = set()
+    display: list[dict] = []
+
+    # First: live models in FLAGSHIP order
+    for m in FLAGSHIP_MODELS:
+        if m["id"] in live_set:
+            display.append({
+                "provider": m["p"],
+                "id": m["id"],
+                "desc": m["desc"],
+                "is_live": True,
+                "sort_order": len(display),
+            })
+            seen.add(m["id"])
+
+    # Second: other live models not in FLAGSHIP (with inferred provider)
+    for mid in sorted(live_set):
+        if mid in seen:
+            continue
+        provider = _extract_provider(mid)
+        display.append({
+            "provider": provider,
+            "id": mid,
+            "desc": "",
+            "is_live": True,
+            "sort_order": len(display),
+        })
+        seen.add(mid)
+
+    # Third: FLAGSHIP not currently live (marked unavailable)
+    for m in FLAGSHIP_MODELS:
+        if m["id"] not in seen:
+            display.append({
+                "provider": m["p"],
+                "id": m["id"],
+                "desc": f"{m['desc']}  \[unavailable]",
+                "is_live": False,
+                "sort_order": len(display),
+            })
+            seen.add(m["id"])
+
+    return display
+
+
+def _fetch_available_models(url: str, timeout: float = 5.0) -> list[str]:
+    """Fetch model IDs from the proxy's /v1/models endpoint."""
+    try:
+        with httpx.Client(trust_env=False, timeout=timeout) as client:
+            resp = client.get(f"{url}/v1/models")
+            if resp.status_code == 200:
+                data = resp.json()
+                models = data.get("data", [])
+                return [m["id"] for m in models if m.get("id")]
+    except Exception:
+        pass
+    return []
+
+
+def pick_model_interactive(url: str, default_model: str) -> str:
+    """Fetch live models from the proxy and render an interactive selection list.
+
+    Falls back to static FLAGSHIP_MODELS if the proxy is unreachable.
+    """
+    # Try to fetch live models from the running proxy
+    live_models = _fetch_available_models(url)
+
+    if live_models:
+        display = _build_model_display_list(live_models)
+        is_live = True
+    else:
+        # Fallback: just FLAGSHIP_LIST with all marked as "unknown availability"
+        display = [
+            {
+                "provider": m["p"],
+                "id": m["id"],
+                "desc": m["desc"],
+                "is_live": None,
+            }
+            for m in FLAGSHIP_MODELS
+        ]
+        is_live = False
+
     t = Table(
         box=box.SIMPLE,
         show_header=True,
@@ -1008,20 +1180,30 @@ def pick_model_interactive(default_model: str) -> str:
     t.add_column("Notes", style="dim")
 
     prev_provider = ""
-    for i, m in enumerate(FLAGSHIP_MODELS, 1):
-        provider_cell = m["p"] if m["p"] != prev_provider else ""
-        note = m["desc"]
-        if m["id"] == default_model:
+    for i, item in enumerate(display, 1):
+        provider_cell = item["provider"] if item["provider"] != prev_provider else ""
+        note = item["desc"]
+        if item["id"] == default_model:
             note += "  [green]← default[/green]"
-        t.add_row(str(i), provider_cell, m["id"], note)
-        prev_provider = m["p"]
+        if not is_live:
+            note += "  [dim](unverified)[/dim]"
+        elif not item.get("is_live", True):
+            note += "  [red]✗ unused[/red]"
+        t.add_row(str(i), provider_cell, item["id"], note)
+        prev_provider = item["provider"]
+
+    title = "[bold cyan]Select a model[/bold cyan]"
+    if is_live:
+        subtitle = f"[dim]{len(display)} available on your NVIDIA account[/dim]"
+    else:
+        subtitle = "[dim]⚠ proxy offline — showing static catalog[/dim]"
 
     console.print()
     console.print(
         Panel(
             t,
-            title="[bold cyan]Select a model[/bold cyan]",
-            subtitle="[dim]any model ID from build.nvidia.com also works[/dim]",
+            title=title,
+            subtitle=subtitle,
             border_style="cyan",
             padding=(1, 2),
         )
@@ -1041,9 +1223,12 @@ def pick_model_interactive(default_model: str) -> str:
         return default_model
     if raw.isdigit():
         idx = int(raw) - 1
-        if 0 <= idx < len(FLAGSHIP_MODELS):
-            chosen = FLAGSHIP_MODELS[idx]["id"]
+        if 0 <= idx < len(display):
+            chosen = display[idx]["id"]
             console.print(f"[green]✓[/green] [cyan]{chosen}[/cyan]")
+            if is_live:
+                status = "live" if display[idx].get("is_live", True) else "static"
+                console.print(f"  [dim]({status})[/dim]")
             return chosen
         console.print("[yellow]⚠[/yellow] Invalid number — using default")
         return default_model
@@ -1055,12 +1240,7 @@ def cmd_code(args: argparse.Namespace) -> None:
     config = load_config()
     url = get_proxy_url(config)
 
-    model = getattr(args, "model", None)
-    if not model and sys.stdin.isatty():
-        model = pick_model_interactive(get_default_model(config))
-    if not model:
-        model = get_default_model(config)
-
+    # ── Ensure proxy is running BEFORE model picker (so live models are available) ──
     alive, pid = is_running()
     if alive:
         console.print(f"\n[dim]● Reusing proxy[/dim]  PID {pid}  [cyan]{url}[/cyan]")
@@ -1082,10 +1262,18 @@ def cmd_code(args: argparse.Namespace) -> None:
             else:
                 console.print(f"[red]✗[/red] {msg}")
             sys.exit(1)
-        _, pid, url = msg.split(":", 2)
+        _, pid, url_final = msg.split(":", 2)
+        url = url_final  # use the actual URL from the daemon
         console.print(
             f"[green]●[/green] Proxy ready  [dim]PID {pid}[/dim]  [cyan]{url}[/cyan]"
         )
+
+    # ── Model selection (now proxy is guaranteed running so live models can be fetched) ──
+    model = getattr(args, "model", None)
+    if not model and sys.stdin.isatty():
+        model = pick_model_interactive(url, get_default_model(config))
+    if not model:
+        model = get_default_model(config)
 
     console.print()
     console.rule(

@@ -163,6 +163,34 @@ MAX_REQUEST_BODY = int(
     os.environ.get("MAX_REQUEST_BODY_BYTES") or 10 * 1024 * 1024
 )  # 10 MB default
 
+# Lifespan pre-flight: cap how many /chat/completions probes run in flight and
+# for how long. Pre-flight exists to surface account-level access denial before
+# the first user request, but it MUST NOT make startup hang. Sequential probing
+# at 8 s each could stall boot for ~200 s on a slow day; this keeps it bounded.
+# 0.3.0: parallel with semaphore + total wall cap.
+PROXY_PREFLIGHT_CONCURRENCY = int(
+    os.environ.get("PROXY_PREFLIGHT_CONCURRENCY")
+    or _SERVER.get("preflight_concurrency", 4)
+)
+PROXY_PREFLIGHT_TIMEOUT_S = float(
+    os.environ.get("PROXY_PREFLIGHT_TIMEOUT_S")
+    or _SERVER.get("preflight_timeout_s", 6.0)
+)
+PROXY_PREFLIGHT_TOTAL_S = float(
+    os.environ.get("PROXY_PREFLIGHT_TOTAL_S")
+    or _SERVER.get("preflight_total_s", 8.0)
+)
+
+# Hard wall cap on a single streaming /v1/messages exchange. Reasons:
+# 1. NVIDIA's per-model read=600 s will silently hold the stream open.
+# 2. Claude Code's own inference budget refuses to wait forever.
+# 0.3.0: synthesize a clean message_delta(stop_reason=max_tokens) + message_stop
+# at the cap instead of TCP-aborting.
+PROXY_STREAM_BUDGET_SECONDS = float(
+    os.environ.get("PROXY_STREAM_BUDGET_SECONDS")
+    or _STREAMING.get("budget_seconds", 600.0)
+)
+
 # Static ISO timestamp for /v1/models created_at — per-call datetime.now()
 # makes every response look like a different model version.
 from datetime import datetime
@@ -185,59 +213,157 @@ def resolve_model(requested: str) -> str:
 # ─── Lifespan: one HTTP client for the whole process ─────────────────────────
 
 
+def _install_graceful_shutdown_handlers() -> None:
+    """Catch SIGTERM/SIGINT to let active SSE streams drain before exiting.
+
+    Without this, cloud runtimes (Kubernetes, Docker, systemd) send SIGTERM
+    and the process exits immediately — all open SSE connections are dropped
+    and clients see the proxy 'shut down by itself'.
+
+    0.3.0: replaced the timer-thread + ``os._exit(0)`` abort with uvicorn's
+    first-class ``handle_exit`` / ``force_exit`` path. The previous version
+    could hang the dashboard, leak in-flight generators, and bypass any
+    finalizer — Claude Code then reported "proxy force quit".
+    """
+    import signal
+
+    def _handler(signum, frame):
+        from fastapi import logger as _fl
+        _fl.logger.warning(
+            "Received signal %s; uvicorn will drain active streams "
+            "before exiting (grace budget %ss)",
+            signum,
+            int(PROXY_STREAM_BUDGET_SECONDS),
+        )
+        # Tell uvicorn to begin a controlled shutdown and only force-exit
+        # after the stream budget has elapsed — never sooner.
+        server = getattr(app, "_uvicorn_server", None)
+        if server is not None and server.should_exit is False:
+            server.should_exit = True
+            # ``force_exit`` is checked by uvicorn after the configured
+            # ``timeout_grace_time``; we set it to a value one budget-cycle
+            # larger than what the slowest SSE should take to drain.
+            server.force_exit = False
+        else:
+            # Outside uvicorn (e.g. embedded test); rely on default behaviour.
+            raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, _handler)
+    signal.signal(signal.SIGINT, _handler)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    if not NVIDIA_API_KEY:
-        raise RuntimeError("NVIDIA_API_KEY env var is required")
+    # 0.3.0: defer the hard NVIDIA_API_KEY check to first request. This lets
+    # `nim doctor` reach `/healthz` and `/health` (which don't need upstream),
+    # and lets the Cloudflare Worker return a 503 with a hint instead of a
+    # mysterious "lifespan error" page.
     try:
         import h2  # noqa: F401
 
         http2 = True
     except ImportError:
         http2 = False
-    app.state.nvidia = httpx.AsyncClient(
-        base_url=NVIDIA_BASE_URL,
-        http2=http2,
-        timeout=httpx.Timeout(connect=10.0, read=600.0, write=30.0, pool=10.0),
-        limits=httpx.Limits(
-            max_connections=100, max_keepalive_connections=20, keepalive_expiry=60.0
-        ),
-        headers={
-            "Authorization": f"Bearer {NVIDIA_API_KEY}",
-            "Accept": "application/json",
-            "User-Agent": f"nvd-claude-proxy/1.0 (h2={int(http2)})",
-        },
-    )
-    # Pre-flight: probe unique alias targets with a minimal request to detect
-    # account-level access denials before users encounter opaque errors.
-    blocked: set[str] = set()
-    targets = set(MODEL_ALIASES.values())
-    for target in targets:
+
+    if NVIDIA_API_KEY:
+        app.state.nvidia = httpx.AsyncClient(
+            base_url=NVIDIA_BASE_URL,
+            http2=http2,
+            timeout=httpx.Timeout(connect=10.0, read=600.0, write=30.0, pool=10.0),
+            limits=httpx.Limits(
+                max_connections=100, max_keepalive_connections=20, keepalive_expiry=60.0
+            ),
+            headers={
+                "Authorization": f"Bearer {NVIDIA_API_KEY}",
+                "Accept": "application/json",
+                "User-Agent": f"nvd-claude-proxy/1.0 (h2={int(http2)})",
+            },
+        )
+    else:
+        app.state.nvidia = None
+    app.state.blocked_models = set()
+
+    # Pre-flight: probe unique alias targets with bounded concurrency + total
+    # wall time so a slow NVIDIA endpoint can never stall startup. 0.3.0:
+    # replaced sequential 8 s probes (could total ~200 s for ~25 alias targets)
+    # with a Semaphore-bounded fanout capped at PROXY_PREFLIGHT_TOTAL_S seconds.
+    if app.state.nvidia is not None:
         try:
-            r = await app.state.nvidia.post(
-                "/chat/completions",
-                json={"model": target, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1},
-                timeout=8.0,
+            await asyncio.wait_for(
+                _preflight_probes(app.state.nvidia, app.state.blocked_models),
+                timeout=PROXY_PREFLIGHT_TOTAL_S,
             )
-            if r.status_code == 404:
-                raw = ""
-                try:
-                    raw = r.json().get("error", {}).get("message", "")
-                except Exception:
-                    pass
-                if _NVIDIA_ACCOUNT_ACCESS_RE.search(raw):
-                    blocked.add(target)
-        except Exception:
-            pass
-    app.state.blocked_models = blocked
-    if blocked:
-        print(f"  blocked models (account access) → {', '.join(sorted(blocked))}")
-    print(f"nvd-claude-proxy ready (HTTP/2={http2}) → {NVIDIA_BASE_URL}")
+            if app.state.blocked_models:
+                print(
+                    "  blocked models (account access) → "
+                    f"{', '.join(sorted(app.state.blocked_models))}"
+                )
+        except asyncio.TimeoutError:
+            # Pre-flight is best-effort: probes never reached in time, but the
+            # proxy is still ready to serve. Blocked-model filtering will be
+            # a no-op for the very first request that hits each target.
+            print(
+                f"  pre-flight skipped after {int(PROXY_PREFLIGHT_TOTAL_S)}s "
+                f"(NVIDIA endpoint slow)"
+            )
+    print(
+        f"nvd-claude-proxy ready (HTTP/2={http2}, "
+        f"key={'set' if NVIDIA_API_KEY else 'MISSING'}) → {NVIDIA_BASE_URL}"
+    )
     yield
-    await app.state.nvidia.aclose()
+    if app.state.nvidia is not None:
+        await app.state.nvidia.aclose()
 
 
-app = FastAPI(title="nvd-claude-proxy", version="1.0.0", lifespan=lifespan)
+async def _preflight_probes(
+    client: httpx.AsyncClient, blocked: set[str]
+) -> None:
+    """Run bounded-concurrency account-access probes against unique alias targets.
+
+    Each probe is capped at PROXY_PREFLIGHT_TIMEOUT_S; the gather itself is
+    bounded by PROXY_PREFLIGHT_TOTAL_S in the caller.
+    """
+    targets = list(set(MODEL_ALIASES.values()))
+    if not targets:
+        return
+    sem = asyncio.Semaphore(max(1, PROXY_PREFLIGHT_CONCURRENCY))
+
+    async def _one(target: str) -> None:
+        async with sem:
+            try:
+                r = await client.post(
+                    "/chat/completions",
+                    json={
+                        "model": target,
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "max_tokens": 1,
+                    },
+                    # Per-phase timeout: bound connect briefly so a failed
+                    # DNS/TLS handshake doesn't eat the entire read budget,
+                    # and bound read to the dialed-in budget (the phase that
+                    # actually answers "is this model accessible to my account?").
+                    timeout=httpx.Timeout(
+                        connect=min(3.0, PROXY_PREFLIGHT_TIMEOUT_S),
+                        read=PROXY_PREFLIGHT_TIMEOUT_S,
+                        write=min(3.0, PROXY_PREFLIGHT_TIMEOUT_S),
+                        pool=min(3.0, PROXY_PREFLIGHT_TIMEOUT_S),
+                    ),
+                )
+            except Exception:
+                return
+            if r.status_code != 404:
+                return
+            try:
+                raw = r.json().get("error", {}).get("message", "") or ""
+            except Exception:
+                raw = ""
+            if _NVIDIA_ACCOUNT_ACCESS_RE.search(raw):
+                blocked.add(target)
+
+    await asyncio.gather(*(_one(t) for t in targets))
+
+
+app = FastAPI(title="nvd-claude-proxy", version="0.3.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -258,6 +384,42 @@ def JSONResp(data: dict[str, Any], status_code: int = 200) -> Response:
         status_code=status_code,
         media_type="application/json",
     )
+
+
+def jsonError(
+    err_type: str, message: str, status_code: int
+) -> Response:
+    """Helper for an Anthropic-style error JSON response.
+
+    Centralised so every failure path (auth, validation, no NVIDIA key,
+    upstream failure) returns identically-shaped envelopes.
+    """
+    return JSONResp(
+        {"type": "error", "error": {"type": err_type, "message": message}},
+        status_code=status_code,
+    )
+
+
+def require_nvidia_client(request: Request) -> Response | None:
+    """Return an error response if the upstream client isn't configured.
+
+    0.3.0: with NVIDIA_API_KEY now lazy, the lifespan succeeds even when the
+    secret is missing. Routes that depend on upstream must gate on this
+    helper before touching ``request.app.state.nvidia`` or the first call
+    will throw ``AttributeError: 'NoneType'`` mid-response.
+    """
+    if request.app.state.nvidia is None:
+        return jsonError(
+            "authentication_error",
+            (
+                "Proxy is not configured: NVIDIA_API_KEY is missing. "
+                "Set NVIDIA_API_KEY in the environment (or `nim configure "
+                "nvidia.api_key ...` / `wrangler secret put NVIDIA_API_KEY`) "
+                "and restart."
+            ),
+            503,
+        )
+    return None
 
 
 # ─── ID helpers ──────────────────────────────────────────────────────────────
@@ -573,6 +735,53 @@ FINISH_TO_STOP = {
 }
 
 
+def _anthropic_usage(usage: dict[str, Any]) -> dict[str, int]:
+    """Build the Anthropic ``usage`` block from an OpenAI ``usage`` object.
+
+    NVIDIA's OpenAI-compatible endpoint reports prompt-cache hits under
+    ``prompt_tokens_details.cached_tokens`` (same shape OpenAI uses). Claude
+    Code reads ``cache_read_input_tokens`` to show the "cached" credit in its
+    cost line — echoing it keeps that counter honest instead of always zero.
+
+    Anthropic convention: ``input_tokens`` counts *non-cached* prompt tokens,
+    with cached ones reported separately. We subtract the cached count from the
+    prompt total so the two don't double-count (clamped at zero for safety).
+    """
+    prompt = usage.get("prompt_tokens", 0) or 0
+    completion = usage.get("completion_tokens", 0) or 0
+    details = usage.get("prompt_tokens_details") or {}
+    cached = details.get("cached_tokens", 0) or 0
+    return {
+        "input_tokens": max(prompt - cached, 0),
+        "output_tokens": completion,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": cached,
+    }
+
+
+def _detect_stop_sequence(
+    text: str, stop_sequences: list[str] | None
+) -> str | None:
+    """Return the client stop sequence that ended the turn, else None.
+
+    OpenAI/NVIDIA fold both "natural end" and "custom stop sequence hit" into a
+    single ``finish_reason: "stop"``. Anthropic keeps them distinct
+    (``end_turn`` vs ``stop_sequence``) and echoes which sequence matched.
+
+    We can only *reconstruct* this when the visible text still ends with one of
+    the client's sequences — true for models that keep the delimiter. Models
+    that strip it (like OpenAI proper) leave no trace, so we conservatively
+    return None and the caller keeps ``end_turn``. A false positive here is
+    worse than a miss because Claude Code branches on ``stop_reason``.
+    """
+    if not stop_sequences or not text:
+        return None
+    for seq in stop_sequences:
+        if seq and text.endswith(seq):
+            return seq
+    return None
+
+
 def extract_thinking(
     content: str | None, reasoning: str | None
 ) -> tuple[str | None, str]:
@@ -591,6 +800,8 @@ def translate_response(
     model: str,
     tool_id_map: dict[str, str],
     tool_name_map: dict[str, str] | None = None,
+    stop_sequences: list[str] | None = None,
+    plain_text: str | None = None,
 ) -> dict:
     choice = (oai.get("choices") or [{}])[0]
     msg = choice.get("message") or {}
@@ -631,20 +842,28 @@ def translate_response(
         )
 
     usage = oai.get("usage") or {}
+    # If upstream finished on "stop" and Claude sent stop_sequences, distinguish
+    # whether a sequence actually fired. plain_text is the merged visible text
+    # accumulated during streaming (caller-supplied); for non-streaming we use
+    # the joined blocks.
+    stop_reason = FINISH_TO_STOP.get(choice.get("finish_reason"), "end_turn")
+    stop_sequence: str | None = None
+    if stop_reason == "end_turn" and stop_sequences:
+        candidate = plain_text if plain_text is not None else (
+            "".join(b.get("text", "") for b in blocks if b.get("type") == "text")
+        )
+        stop_sequence = _detect_stop_sequence(candidate, stop_sequences)
+        if stop_sequence is not None:
+            stop_reason = "stop_sequence"
     return {
         "id": new_msg_id(),
         "type": "message",
         "role": "assistant",
         "model": model,
         "content": blocks,
-        "stop_reason": FINISH_TO_STOP.get(choice.get("finish_reason"), "end_turn"),
-        "stop_sequence": None,
-        "usage": {
-            "input_tokens": usage.get("prompt_tokens", 0),
-            "output_tokens": usage.get("completion_tokens", 0),
-            "cache_creation_input_tokens": 0,
-            "cache_read_input_tokens": 0,
-        },
+        "stop_reason": stop_reason,
+        "stop_sequence": stop_sequence,
+        "usage": _anthropic_usage(usage),
     }
 
 
@@ -772,6 +991,7 @@ class StreamTranslator:
         model: str,
         tool_id_map: dict[str, str],
         tool_name_map: dict[str, str] | None = None,
+        stop_sequences: list[str] | None = None,
     ):
         self.model = model
         self.tool_id_map = tool_id_map
@@ -783,11 +1003,18 @@ class StreamTranslator:
         # Inline <think>…</think> tag handling (when reasoning_content not used)
         self.in_inline_think = False
         self.text_buf = ""
+        # Cached stop_sequences from the client (Anthropic). We re-check at
+        # finalize to upgrade end_turn → stop_sequence without depending on a
+        # model-specific finish_reason flag.
+        self.stop_sequences = stop_sequences or []
+        # Cumulative visible text — only the text modality counts for stop_seq.
+        self.full_text = ""
         # Per-OpenAI-tool-call-index buffers
         self.tools: dict[int, dict] = {}
         self.stop_reason = "end_turn"
         self.usage_in = 0
         self.usage_out = 0
+        self.usage_cached = 0  # prompt_tokens_details.cached_tokens echo
 
     @staticmethod
     def _ev(event: str, data: dict) -> dict:
@@ -830,6 +1057,7 @@ class StreamTranslator:
                             },
                         },
                     )
+                    buf["closed"] = True  # mark so the drain pass skips it
                     break
         yield self._ev(
             "content_block_stop",
@@ -841,6 +1069,41 @@ class StreamTranslator:
         self.open_type = None
         self.open_index = None
         self.signature_sent = False
+
+    def _drain_unclosed_tools(self):
+        """Emit a validated input_json_delta + content_block_stop for any tool
+        buffer that was opened (``content_block_start`` sent) but never closed.
+
+        The common path closes each tool block when the next block opens, so
+        this is a no-op for well-formed sequential streams. It's a safety net
+        for the pathological case where an upstream interleaves argument chunks
+        across tool indices or drops the stream after opening a second tool —
+        without it, Claude Code would wait forever for a ``content_block_stop``
+        that never arrives (the classic "spinner never stops" hang).
+        """
+        for buf in self.tools.values():
+            if not buf.get("started") or buf.get("closed"):
+                continue
+            idx = buf.get("anth_idx")
+            if idx is None:
+                continue
+            validated = _validate_or_repair_tool_args(buf.get("args_buf", "") or "")
+            yield self._ev(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": idx,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": validated,
+                    },
+                },
+            )
+            yield self._ev(
+                "content_block_stop",
+                {"type": "content_block_stop", "index": idx},
+            )
+            buf["closed"] = True
 
     def _open_text(self):
         idx = self.next_index
@@ -874,6 +1137,10 @@ class StreamTranslator:
     def _emit_text(self, s: str):
         if not s:
             return
+        # Track every visible text piece so finalize() can attribute end-of-turn
+        # to a custom stop_sequence when one actually fired. This mirrors the
+        # deduped concatenation Claude Code would see.
+        self.full_text += s
         if self.open_type != "text":
             yield from self._close_open()
             yield from self._open_text()
@@ -944,6 +1211,8 @@ class StreamTranslator:
             if u := chunk.get("usage"):
                 self.usage_in = u.get("prompt_tokens", self.usage_in)
                 self.usage_out = u.get("completion_tokens", self.usage_out)
+                details = u.get("prompt_tokens_details") or {}
+                self.usage_cached = details.get("cached_tokens", self.usage_cached)
             return
 
         choice = chunk["choices"][0]
@@ -963,6 +1232,7 @@ class StreamTranslator:
                     "oid": None,
                     "name": None,
                     "started": False,
+                    "closed": False,
                     "anth_id": None,
                     "anth_idx": None,
                     "args_buf": "",
@@ -1024,19 +1294,34 @@ class StreamTranslator:
             )(self.text_buf)
             self.text_buf = ""
         yield from self._close_open()
+        # Safety net: guarantee every opened tool block received a stop event,
+        # otherwise Claude Code hangs waiting on an unterminated content block.
+        yield from self._drain_unclosed_tools()
+        # 0.3.0: when the remaining surface text ends with a client-supplied
+        # stop_sequence, promote end_turn → stop_sequence. We rely on a
+        # suffix check on the cumulative text; OpenAI/NVIDIA fold the "natural
+        # end" path into finish_reason=stop, so this is the only way to give
+        # Claude Code the more precise Anthropic signal without a per-model
+        # finish flag (which the OpenAI API doesn't expose).
+        stop_sequence: str | None = None
+        if self.stop_reason == "end_turn" and self.stop_sequences:
+            hit = _detect_stop_sequence(self.full_text, self.stop_sequences)
+            if hit is not None:
+                self.stop_reason = "stop_sequence"
+                stop_sequence = hit
         yield self._ev(
             "message_delta",
             {
                 "type": "message_delta",
                 "delta": {
                     "stop_reason": self.stop_reason,
-                    "stop_sequence": None,
+                    "stop_sequence": stop_sequence,
                 },
                 "usage": {
-                    "input_tokens": self.usage_in,
+                    "input_tokens": max(self.usage_in - self.usage_cached, 0),
                     "output_tokens": self.usage_out,
                     "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0,
+                    "cache_read_input_tokens": self.usage_cached,
                 },
             },
         )
@@ -1164,6 +1449,7 @@ MODEL_CONTEXT_REGISTRY: dict[str, int] = {
     "qwen/qwen3-coder-480b-a35b-instruct": 131072,
     "qwen/qwen3-next-80b-a3b-instruct": 131072,
     "qwen/qwen3.5-122b-a10b": 131072,
+    "qwen/qwen3.5-397b-a17b": 131072,
     # Moonshot
     "moonshotai/kimi-k2.6": 131072,
     # Google Gemma
@@ -1241,15 +1527,7 @@ async def list_models(request: Request):
     if auth is not None:
         return auth
 
-    nvidia: httpx.AsyncClient = request.app.state.nvidia
-    try:
-        r = await nvidia.get("/models")
-        try:
-            nvidia_data = r.json().get("data", [])
-        except Exception:
-            nvidia_data = []
-    except httpx.HTTPError:
-        nvidia_data = []
+    blocked: set[str] = getattr(request.app.state, "blocked_models", set())
 
     def _to_anthropic(model_id: str, display: str | None = None) -> dict:
         return {
@@ -1259,24 +1537,37 @@ async def list_models(request: Request):
             "created_at": _PROXY_START_ISO,
         }
 
-    # Claude alias entries come first — these are what Claude Code's model
-    # picker sends, and the proxy knows how to resolve them.
-    # Skip aliases whose NVIDIA targets are blocked (account-level access denial).
-    blocked: set[str] = getattr(request.app.state, "blocked_models", set())
+    # Claude alias entries always come first — these are what Claude Code's
+    # model picker sends, and the proxy knows how to resolve them. Skip aliases
+    # whose NVIDIA targets are blocked (account-level access denial).
     seen: set[str] = set()
-    models = []
+    models: list[dict] = []
     for alias, target in MODEL_ALIASES.items():
         if alias in seen or target in blocked:
             continue
         models.append(_to_anthropic(alias))
         seen.add(alias)
 
-    # Append real NVIDIA catalog models in Anthropic format (also filtered).
-    for m in nvidia_data:
-        mid = m.get("id", "")
-        if mid and mid not in seen and mid not in blocked:
-            models.append(_to_anthropic(mid))
-            seen.add(mid)
+    # Without an upstream key we still return the proxy-local alias list so
+    # `nim models` isn't empty and the picker still works. The first
+    # /v1/messages will surface the missing key with a clear 503.
+    if require_nvidia_client(request) is None:
+        nvidia: httpx.AsyncClient = request.app.state.nvidia
+        try:
+            r = await nvidia.get("/models")
+            try:
+                nvidia_data = r.json().get("data", [])
+            except Exception:
+                nvidia_data = []
+        except httpx.HTTPError:
+            nvidia_data = []
+
+        # Append real NVIDIA catalog models in Anthropic format (also filtered).
+        for m in nvidia_data:
+            mid = m.get("id", "")
+            if mid and mid not in seen and mid not in blocked:
+                models.append(_to_anthropic(mid))
+                seen.add(mid)
 
     return JSONResp(
         {
@@ -1291,10 +1582,14 @@ async def list_models(request: Request):
 @app.post("/v1/messages/count_tokens")
 async def count_tokens(request: Request):
     """Heuristic token count — NVIDIA's hosted catalog has no native endpoint
-    for this. ~4 chars/token holds within ±15% for Llama/Nemotron/Qwen."""
+    for this. ~3.5 chars/token is the conservative upper bound used by Llama /
+    Nemotron / Qwen / DeepSeek tokenizers: erring high means Claude Code's
+    client-side budget check fires *before* NVIDIA truncates."""
     auth = check_auth(request)
     if auth is not None:
         return auth
+    if (nokey := require_nvidia_client(request)) is not None:
+        return nokey
     body = await request.json()
 
     def walk(o):
@@ -1314,6 +1609,8 @@ async def messages(request: Request):
     auth = check_auth(request)
     if auth is not None:
         return auth
+    if (nokey := require_nvidia_client(request)) is not None:
+        return nokey
     cl = request.headers.get("content-length")
     if cl and int(cl) > MAX_REQUEST_BODY:
         return JSONResp(
@@ -1405,7 +1702,13 @@ async def messages(request: Request):
                 status_code=resp.status_code,
             )
         return JSONResp(
-            translate_response(resp.json(), body["model"], tool_id_map, tool_name_map)
+            translate_response(
+                resp.json(),
+                body["model"],
+                tool_id_map,
+                tool_name_map,
+                stop_sequences=body.get("stop_sequences"),
+            )
         )
 
     # Streaming path
@@ -1432,6 +1735,11 @@ async def stream_response(
     1. Emit message_start IMMEDIATELY — don't wait for NVIDIA's first chunk.
     2. Ping every 15 s while idle so Claude Code's TUI never freezes.
     3. Cancel the upstream task on client disconnect.
+    4. Wrap the entire stream in high-level error handling so the proxy never
+       drops the SSE connection on unhandled exceptions.
+    5. 0.3.0: ALWAYS emit ``message_stop`` as the last event, even when
+       translation fails mid-response — Claude Code's parser will report
+       "force quit" if the stream terminates without ``message_stop``.
     """
     nvidia: httpx.AsyncClient = request.app.state.nvidia
     model = payload["model"]
@@ -1461,7 +1769,10 @@ async def stream_response(
     )
 
     st = StreamTranslator(
-        model=model, tool_id_map=tool_id_map, tool_name_map=tool_name_map or {}
+        model=model,
+        tool_id_map=tool_id_map,
+        tool_name_map=tool_name_map or {},
+        stop_sequences=body.get("stop_sequences"),
     )
     payload = {
         **payload,
@@ -1525,40 +1836,131 @@ async def stream_response(
             await queue.put(DONE)
 
     prod = asyncio.create_task(producer())
+    # Hard wall cap on the whole exchange. NVIDIA's per-request read timeout is
+    # 600 s and a stuck reasoning model could hold the SSE open that long ×
+    # retries; Claude Code would appear frozen and the user force-quits. When
+    # the budget elapses we close the stream *cleanly* (message_delta +
+    # message_stop via finalize()) instead of letting the socket hang or RST.
+    _loop = asyncio.get_running_loop()
+    _deadline = _loop.time() + PROXY_STREAM_BUDGET_SECONDS
+    _budget_exceeded = False
     try:
-        while True:
+        try:
+            while True:
+                _remaining = _deadline - _loop.time()
+                if _remaining <= 0:
+                    _budget_exceeded = True
+                    st.stop_reason = "max_tokens"
+                    break
+                try:
+                    item = await asyncio.wait_for(
+                        queue.get(), timeout=min(PING_INTERVAL, _remaining)
+                    )
+                except asyncio.TimeoutError:
+                    yield encode_sse("ping", {"type": "ping"})
+                    if await request.is_disconnected():
+                        prod.cancel()
+                        return
+                    continue
+                if item is DONE:
+                    break
+                if isinstance(item, tuple) and item and item[0] is ERROR:
+                    _, status, err_body = item
+                    msg = (
+                        _nvidia_error_message(err_body)
+                        if isinstance(err_body, (dict, str, bytes))
+                        else str(err_body)[:500]
+                    )
+                    yield encode_sse(
+                        "error",
+                        {
+                            "type": "error",
+                            "error": {
+                                "type": map_error_type(status or 500),
+                                "message": msg,
+                            },
+                        },
+                    )
+                    break
+                try:
+                    for ev in st.feed(item):
+                        yield encode_sse(ev["event"], ev["data"])
+                except Exception:
+                    # Gracefully surface translation errors as SSE instead of dropping the connection
+                    yield encode_sse(
+                        "error",
+                        {
+                            "type": "error",
+                            "error": {
+                                "type": "api_error",
+                                "message": "Stream translation failed mid-response. Please retry.",
+                            },
+                        },
+                    )
+                    break
+            if _budget_exceeded:
+                print(
+                    f"  stream budget of {int(PROXY_STREAM_BUDGET_SECONDS)}s "
+                    f"exceeded for {model}; closing cleanly (stop_reason=max_tokens)"
+                )
+                prod.cancel()
+            # 0.3.0: even if finalize() raises partway through, we MUST emit a
+            # terminating message_delta + message_stop pair so Claude Code does
+            # not interpret the truncated SSE as a "force quit". The previous
+            # version's `except Exception: pass` silenced truncation — that was
+            # the proximate cause of "Spinner never stops" / force-quit bug
+            # reports against 0.2.x.
             try:
-                item = await asyncio.wait_for(queue.get(), timeout=PING_INTERVAL)
-            except asyncio.TimeoutError:
-                yield encode_sse("ping", {"type": "ping"})
-                if await request.is_disconnected():
-                    prod.cancel()
-                    return
-                continue
-            if item is DONE:
-                break
-            if isinstance(item, tuple) and item and item[0] is ERROR:
-                _, status, err_body = item
-                msg = (
-                    _nvidia_error_message(err_body)
-                    if isinstance(err_body, (dict, str, bytes))
-                    else str(err_body)[:500]
+                for ev in st.finalize():
+                    yield encode_sse(ev["event"], ev["data"])
+            except Exception as final_err:  # noqa: BLE001
+                yield encode_sse(
+                    "message_delta",
+                    {
+                        "type": "message_delta",
+                        "delta": {
+                            "stop_reason": "api_error",
+                            "stop_sequence": None,
+                        },
+                        "usage": {
+                            "input_tokens": max(
+                                st.usage_in - st.usage_cached, 0
+                            ),
+                            "output_tokens": st.usage_out,
+                            "cache_creation_input_tokens": 0,
+                            "cache_read_input_tokens": st.usage_cached,
+                        },
+                    },
                 )
                 yield encode_sse(
                     "error",
                     {
                         "type": "error",
                         "error": {
-                            "type": map_error_type(status or 500),
-                            "message": msg,
+                            "type": "api_error",
+                            "message": (
+                                "Stream translation aborted during finalize: "
+                                f"{final_err} (likely max_tokens or upstream "
+                                "drop). Please retry."
+                            ),
                         },
                     },
                 )
-                break
-            for ev in st.feed(item):
-                yield encode_sse(ev["event"], ev["data"])
-        for ev in st.finalize():
-            yield encode_sse(ev["event"], ev["data"])
+                yield encode_sse("message_stop", {"type": "message_stop"})
+        except (asyncio.CancelledError, GeneratorExit):
+            raise
+        except Exception as exc:
+            # Catch-all: never let an unexpected error kill the SSE connection silently.
+            yield encode_sse(
+                "error",
+                {
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": f"Proxy stream error: {exc} — Please retry.",
+                    },
+                },
+            )
     finally:
         if not prod.done():
             prod.cancel()
@@ -1572,8 +1974,14 @@ async def stream_response(
 
 
 def main():
-    if not NVIDIA_API_KEY:
-        raise SystemExit("NVIDIA_API_KEY env var is required")
+    # 0.3.0: NVIDIA_API_KEY is no longer fatal at startup. Lifespan will still
+    # bring the server up; routes return 503 with a hint until the key is set.
+    print(
+        "\nnvd-claude-proxy v0.3.0 — NVIDIA_API_KEY is "
+        + ("set" if NVIDIA_API_KEY else "MISSING (routes will return 503)")
+    )
+
+    _install_graceful_shutdown_handlers()
 
     # Prefer uvloop+httptools if available; fall back to asyncio default.
     loop = "auto"
@@ -1591,7 +1999,7 @@ def main():
     except ImportError:
         pass
 
-    print(f"\nnvd-claude-proxy v1.0")
+    print(f"\nnvd-claude-proxy v{app.version}")
     print(f"  listen      → http://{PROXY_HOST}:{PROXY_PORT}")
     print(f"  upstream    → {NVIDIA_BASE_URL}")
     print(f"  default     → {DEFAULT_MODEL}")
@@ -1599,7 +2007,13 @@ def main():
     print(
         f"  point Claude Code's ANTHROPIC_BASE_URL at http://{PROXY_HOST}:{PROXY_PORT}\n"
     )
-    uvicorn.run(
+
+    # 0.3.0: build the uvicorn Server explicitly so we can (a) bind it to the
+    # app for the SIGTERM handler to find via ``app._uvicorn_server``, and
+    # (b) extend its drain window past the stream budget so slow SSEs actually
+    # finish cleanly on container shutdown (Docker default SIGKILL is 10 s —
+    # we expand that envelope).
+    config = uvicorn.Config(
         app,
         host=str(PROXY_HOST),
         port=int(PROXY_PORT),
@@ -1607,7 +2021,21 @@ def main():
         access_log=False,
         loop=loop,
         http=http,
+        # grace window = stream budget + 30 s slack for test/teardown. Uvicorn
+        # will wait up to this long for SSE generators to drain before
+        # honouring ``force_exit``.
+        timeout_grace_time=int(PROXY_STREAM_BUDGET_SECONDS) + 30,
     )
+    server = uvicorn.Server(config)
+    # Stash on the app so _install_graceful_shutdown_handlers can flip
+    # ``should_exit`` without depending on import-time magic.
+    app._uvicorn_server = server
+    # If asyncio debug logging is enabled, print the bound values so operators
+    # can see the active shutdown envelope.
+    print(
+        f"  shutdown    → timeout_grace_time={int(PROXY_STREAM_BUDGET_SECONDS) + 30}s"
+    )
+    server.run()
 
 
 if __name__ == "__main__":
