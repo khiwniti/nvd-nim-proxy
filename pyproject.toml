@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "nim-claude-proxy"
-version = "0.3.0"
+version = "0.3.1"
 description = "Anthropic Messages → NVIDIA NIM Proxy for Claude Code"
 readme = "README.md"
 requires-python = ">=3.9"

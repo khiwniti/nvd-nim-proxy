@@ -7,6 +7,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- **Boot crash on `nim proxy` / `nim code`**: 0.3.0 called
+  `uvicorn.Config(..., timeout_grace_time=…)` but uvicorn's actual kwarg is
+  `timeout_graceful_shutdown` — the SIGTERM drain window never existed and
+  the daemon raised `TypeError` before binding a socket. The TestClient
+  suite missed it because it bypasses `main()`. New regression guard
+  `test_main_does_not_crash_at_uvicorn_config_build` constructs the real
+  uvicorn.Config (with `server.run` stubbed) so this class of typo is now
+  caught in CI.
+
 ---
 
 ## [0.3.0] — 2026-07-08

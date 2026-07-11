@@ -66,3 +66,67 @@ def test_count_tokens_enforces_proxy_api_key(monkeypatch):
         r = c.post("/v1/messages/count_tokens", json={"messages": []})
     assert r.status_code == 401
     assert r.json()["error"]["type"] == "authentication_error"
+
+
+def test_uvicorn_config_kwargs_match_real_signature():
+    """Regression guard for the 0.3.0 SIGTERM grace-window crash.
+
+    ``proxy.main()`` builds ``uvicorn.Config`` directly. uvicorn's Config
+    constructor validates kwargs against its signature, so a typo (e.g.
+    ``timeout_grace_time``) raises ``TypeError`` at config construction
+    time and crashes the daemon before uvicorn even starts. The TestClient
+    path doesn't exercise main(), so this guard lives here as an
+    introspection-only assertion.
+
+    If a future uvicorn release renames any of these kwargs, this test
+    must be updated in lockstep.
+    """
+    import inspect
+
+    import uvicorn
+
+    sig = inspect.signature(uvicorn.Config.__init__)
+    accepted = set(sig.parameters)
+
+    # These are the kwargs we pass (or refer to) in proxy.main()'s
+    # uvicorn.Config(...) call. If the proxy code starts passing additional
+    # kwargs, add them here too — silent renames drift the daemon into a
+    # TypeError at boot.
+    required_kwargs = {
+        "app",
+        "host",
+        "port",
+        "log_level",
+        "access_log",
+        "loop",
+        "http",
+        "timeout_graceful_shutdown",  # NOT timeout_grace_time — that's not real
+    }
+    missing = required_kwargs - accepted
+    assert not missing, (
+        "uvicorn.Config no longer accepts these kwargs we rely on: "
+        f"{sorted(missing)}. Update proxy.main() to match the new signature."
+    )
+
+
+def test_main_does_not_crash_at_uvicorn_config_build(monkeypatch):
+    """Drives ``proxy.main()`` just far enough to verify the uvicorn
+    Config kwargs pass validation. We monkey-patch ``uvicorn.Server.run``
+    to a no-op so we don't actually bind a socket or block."""
+    import uvicorn
+
+    class _StubServer:
+        def __init__(self, config):
+            self.config = config
+
+        def run(self):
+            return None
+
+    monkeypatch.setattr(uvicorn, "Server", _StubServer)
+    # Free up a real port for the binding step (uvicorn.Config binds at
+    # construction time when host/port are passed).
+    monkeypatch.setattr(proxy, "PROXY_PORT", 0)
+    monkeypatch.setattr(proxy, "PROXY_HOST", "127.0.0.1")
+
+    # If main() constructed uvicorn.Config successfully, no exception leaks.
+    proxy.main()

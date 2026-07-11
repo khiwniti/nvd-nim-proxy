@@ -35,6 +35,8 @@ dist/
 .claude/tasks/
 .claude/backups/
 
-# Auto-saved transcripts written by `!`-prefixed shell commands in Claude Code.
-# They contain a copy of the conversation verbatim; never commit them.
+# Auto-saved session transcripts written by Claude Code (including the
+# `!`-prefixed shell command caveat dumps and per-date continuation dumps).
+# They contain a verbatim copy of the conversation; never commit them.
 *-local-command-caveat*.txt
+2026-*-*.txt

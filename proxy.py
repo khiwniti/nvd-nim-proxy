@@ -241,7 +241,7 @@ def _install_graceful_shutdown_handlers() -> None:
         if server is not None and server.should_exit is False:
             server.should_exit = True
             # ``force_exit`` is checked by uvicorn after the configured
-            # ``timeout_grace_time``; we set it to a value one budget-cycle
+            # ``timeout_graceful_shutdown``; we set it to a value one budget-cycle
             # larger than what the slowest SSE should take to drain.
             server.force_exit = False
         else:
@@ -363,7 +363,7 @@ async def _preflight_probes(
     await asyncio.gather(*(_one(t) for t in targets))
 
 
-app = FastAPI(title="nvd-claude-proxy", version="0.3.0", lifespan=lifespan)
+app = FastAPI(title="nvd-claude-proxy", version="0.3.1", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -2019,7 +2019,7 @@ def main():
     # 0.3.0: NVIDIA_API_KEY is no longer fatal at startup. Lifespan will still
     # bring the server up; routes return 503 with a hint until the key is set.
     print(
-        "\nnvd-claude-proxy v0.3.0 — NVIDIA_API_KEY is "
+        "\nnvd-claude-proxy v0.3.1 — NVIDIA_API_KEY is "
         + ("set" if NVIDIA_API_KEY else "MISSING (routes will return 503)")
     )
 
@@ -2066,7 +2066,7 @@ def main():
         # grace window = stream budget + 30 s slack for test/teardown. Uvicorn
         # will wait up to this long for SSE generators to drain before
         # honouring ``force_exit``.
-        timeout_grace_time=int(PROXY_STREAM_BUDGET_SECONDS) + 30,
+        timeout_graceful_shutdown=int(PROXY_STREAM_BUDGET_SECONDS) + 30,
     )
     server = uvicorn.Server(config)
     # Stash on the app so _install_graceful_shutdown_handlers can flip
@@ -2075,7 +2075,7 @@ def main():
     # If asyncio debug logging is enabled, print the bound values so operators
     # can see the active shutdown envelope.
     print(
-        f"  shutdown    → timeout_grace_time={int(PROXY_STREAM_BUDGET_SECONDS) + 30}s"
+        f"  shutdown    → timeout_graceful_shutdown={int(PROXY_STREAM_BUDGET_SECONDS) + 30}s"
     )
     server.run()
 
