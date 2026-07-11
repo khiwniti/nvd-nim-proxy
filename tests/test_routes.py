@@ -22,14 +22,25 @@ def test_healthz_returns_ok():
         # by short-circuiting before issuing the request only if needed.
         r = c.get("/healthz")
     assert r.status_code == 200
-    assert r.json() == {"status": "ok"}
+    # Backwards-compat: top-level ``status`` is still the liveness signal.
+    # 0.3.0 adds a richer ``components`` block alongside.
+    body = r.json()
+    assert body["status"] == "ok"
+    assert "components" in body
+    assert body["components"]["key_configured"] is True
+    assert body["components"]["upstream_built"] is True
+    assert body["components"]["models_loaded"] >= 1
+    assert isinstance(body["components"]["blocked_models"], list)
+    assert body["components"]["stream_budget_s"] > 0
 
 
 def test_health_alias_returns_ok():
     with _client() as c:
         r = c.get("/health")
     assert r.status_code == 200
-    assert r.json() == {"status": "ok"}
+    # Same envelope shape on both aliases so probes and dashboards
+    # don't have to special-case the path.
+    assert r.json()["status"] == "ok"
 
 
 def test_messages_rejects_missing_required_fields():

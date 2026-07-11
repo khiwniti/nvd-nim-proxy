@@ -158,3 +158,96 @@ def test_context_safe_max_tokens_returns_none_when_no_room():
         "However, the model's context length is only 202752 tokens."
     )
     assert proxy._context_safe_max_tokens(msg) is None
+
+
+def test_detect_stop_sequence_returns_match_for_visible_suffix():
+    """When the model keeps a custom stop_sequence in the visible text,
+    we should attribute end-of-turn to that sequence and echo it back."""
+    assert proxy._detect_stop_sequence("Hello END", ["END"]) == "END"
+    # Multi-sequence: the *latest* suffix wins (matches the order the model
+    # emitted in, which is the only ordering Anthropic cares about).
+    assert proxy._detect_stop_sequence("xyz###", ["###", "##"]) == "###"
+
+
+def test_detect_stop_sequence_is_strict_suffix_only():
+    """An internal substring (not at the end of the text) must not match -
+    a false positive here would branch Claude Code on a bogus stop_reason."""
+    assert proxy._detect_stop_sequence("Hello END world", ["END"]) is None
+    # Empty sequences, empty text, and none passed: always no match.
+    assert proxy._detect_stop_sequence("Hello", []) is None
+    assert proxy._detect_stop_sequence("", ["x"]) is None
+    assert proxy._detect_stop_sequence("Hello", [""]) is None
+    assert proxy._detect_stop_sequence("Hello", None) is None
+
+
+def test_lazy_key_returns_503_from_messages(monkeypatch):
+    """With no NVIDIA_API_KEY, /v1/messages must return a clean 503 with a
+    hint about how to set the secret — never a 500 AttributeError from the
+    upstream client being None."""
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr(proxy, "NVIDIA_API_KEY", "")
+    with TestClient(proxy.app, raise_server_exceptions=False) as c:
+        r = c.post(
+            "/v1/messages",
+            json={
+                "model": "claude-3-5-sonnet-20241022",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 16,
+            },
+        )
+    assert r.status_code == 503
+    body = r.json()
+    assert body["type"] == "error"
+    assert body["error"]["type"] == "authentication_error"
+    # Actionable hint, not a bare "key missing".
+    assert "NVIDIA_API_KEY" in body["error"]["message"]
+
+
+def test_lazy_key_returns_503_from_count_tokens(monkeypatch):
+    """Same no-key contract applies to /v1/messages/count_tokens."""
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr(proxy, "NVIDIA_API_KEY", "")
+    with TestClient(proxy.app, raise_server_exceptions=False) as c:
+        r = c.post(
+            "/v1/messages/count_tokens",
+            json={
+                "model": "claude-3-5-sonnet-20241022",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+    assert r.status_code == 503
+    assert r.json()["error"]["type"] == "authentication_error"
+
+
+def test_anthropic_usage_separates_cached_from_prompt():
+    """Claude Code credits ``cache_read_input_tokens`` separately from
+    ``input_tokens`` (which represents *non-cached* prompt tokens). The
+    two must not double-count. A cached count larger than the prompt
+    itself (degenerate upstream) must clamp at zero, never go negative."""
+    usage = {
+        "prompt_tokens": 100,
+        "completion_tokens": 5,
+        "prompt_tokens_details": {"cached_tokens": 80},
+    }
+    out = proxy._anthropic_usage(usage)
+    assert out["input_tokens"] == 20
+    assert out["output_tokens"] == 5
+    assert out["cache_read_input_tokens"] == 80
+    assert out["cache_creation_input_tokens"] == 0
+
+    # Degenerate: cached > prompt shouldn't underflow.
+    weird = {
+        "prompt_tokens": 10,
+        "completion_tokens": 1,
+        "prompt_tokens_details": {"cached_tokens": 999},
+    }
+    out2 = proxy._anthropic_usage(weird)
+    assert out2["input_tokens"] == 0
+    assert out2["cache_read_input_tokens"] == 999
+
+    # No details block → zero cached, prompt reported as-is.
+    out3 = proxy._anthropic_usage({"prompt_tokens": 7, "completion_tokens": 2})
+    assert out3["input_tokens"] == 7
+    assert out3["cache_read_input_tokens"] == 0

@@ -1224,7 +1224,15 @@ class StreamTranslator:
         if text := delta.get("content"):
             yield from self._process_text(text)
 
-        for tc in delta.get("tool_calls") or []:
+        # 0.3.0: parallel tool_calls in a single delta. Two passes:
+        #   1. Buffer args + register every tool that's in this delta.
+        #   2. Close whatever was previously open, then emit content_block_start
+        #      for every newly-started tool in the order they were announced.
+        # This avoids the previous behaviour where opening the SECOND tool
+        # prematurely closed the FIRST tool's block, emitting its (still
+        # empty) args_buf before the real args arrived in a later delta.
+        tcs = delta.get("tool_calls") or []
+        for tc in tcs:
             o_idx = tc.get("index", 0)
             buf = self.tools.setdefault(
                 o_idx,
@@ -1247,11 +1255,32 @@ class StreamTranslator:
             # NVIDIA sometimes sends arguments as a pre-parsed dict; normalise to string.
             if isinstance(args, dict):
                 args = json.dumps(args)
+            if args:
+                # Buffer; emit once at block close after validation.
+                buf["args_buf"] = (buf.get("args_buf") or "") + args
 
-            if not buf["started"] and buf["oid"] and buf["name"]:
-                yield from self._close_open()
+        newly_started: list[int] = []
+        for tc in tcs:
+            o_idx = tc.get("index", 0)
+            buf = self.tools[o_idx]
+            if buf["started"]:
+                continue
+            if not (buf["oid"] and buf["name"]):
+                continue
+            newly_started.append(o_idx)
+            buf["started"] = True
+
+        if newly_started:
+            # Close whatever was open (text/thinking/prior tool_use) BEFORE
+            # announcing any of these tools. Exactly one close per feed call
+            # so parallel tools' arg deltas remain buffered as a unit.
+            yield from self._close_open()
+            for o_idx in newly_started:
+                buf = self.tools[o_idx]
                 anth_id = (
-                    buf["oid"] if buf["oid"].startswith("toolu_") else new_tool_id()
+                    buf["oid"]
+                    if buf["oid"].startswith("toolu_")
+                    else new_tool_id()
                 )
                 self.tool_id_map[anth_id] = buf["oid"]
                 buf["anth_id"] = anth_id
@@ -1259,7 +1288,6 @@ class StreamTranslator:
                 self.next_index += 1
                 self.open_type = "tool_use"
                 self.open_index = buf["anth_idx"]
-                buf["started"] = True
                 original_name = self.tool_name_map.get(buf["name"], buf["name"])
                 yield self._ev(
                     "content_block_start",
@@ -1274,9 +1302,6 @@ class StreamTranslator:
                         },
                     },
                 )
-            if buf["started"] and args:
-                # Buffer args; emit once at block close after validation.
-                buf["args_buf"] = (buf.get("args_buf") or "") + args
 
         if finish:
             if self.text_buf:
@@ -1506,8 +1531,25 @@ def check_auth(request: Request):
 
 @app.get("/healthz")
 @app.get("/health")
-async def healthz():
-    return {"status": "ok"}
+async def healthz(request: Request):
+    """Liveness probe with a backwards-compatible envelope.
+
+    Returns ``status: "ok"`` at the top level so existing probes keep working,
+    and adds a ``components`` block for newer ones that want a quick "what is
+    the proxy configured to do" view. No upstream call is made — the proxy
+    should never block on NVIDIA for liveness.
+    """
+    blocked = getattr(request.app.state, "blocked_models", set())
+    components = {
+        # 0.3.0: NVIDIA_API_KEY is now lazy, so ``key_configured`` reflects
+        # whether the lifespan actually built the upstream client.
+        "key_configured": request.app.state.nvidia is not None,
+        "upstream_built": request.app.state.nvidia is not None,
+        "models_loaded": len(MODEL_ALIASES),
+        "blocked_models": sorted(blocked),
+        "stream_budget_s": PROXY_STREAM_BUDGET_SECONDS,
+    }
+    return {"status": "ok", "components": components}
 
 
 @app.get("/v1/models")

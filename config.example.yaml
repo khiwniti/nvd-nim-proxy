@@ -6,6 +6,13 @@ server:
   port: 8787
   log_level: info
   # api_key: optional-client-facing-proxy-key
+  # 0.3.0: lifespan pre-flight knobs. These can also be supplied as
+  # PROXY_PREFLIGHT_CONCURRENCY / PROXY_PREFLIGHT_TIMEOUT_S /
+  # PROXY_PREFLIGHT_TOTAL_S env vars (env wins). Sequential probes against
+  # ~25 alias targets would otherwise stall boot for ~200 s on a slow day.
+  preflight_concurrency: 4
+  preflight_timeout_s: 6.0
+  preflight_total_s: 8.0
 
 nvidia:
   base_url: https://integrate.api.nvidia.com/v1
@@ -23,7 +30,12 @@ nvidia:
 
 streaming:
   ping_interval: 15.0
-  text_delta_chars: 6
+  text_delta_chars: 6.0
+  # 0.3.0: hard wall cap on a single /v1/messages exchange (also overridable
+  # as PROXY_STREAM_BUDGET_SECONDS). When the budget elapses we emit a clean
+  # stop_reason=max_tokens + message_stop instead of letting the upstream
+  # socket hang or RST ("force quit" symptom in Claude Code).
+  budget_seconds: 600.0
 
 context:
   # Claude Code may request very large completions. The proxy clamps output so
