@@ -272,9 +272,28 @@ def start_daemon(config: dict) -> tuple[bool, str]:
         # Reuse it instead of failing with an unactionable "port in use" error.
         if wait_for_proxy(url, timeout=2):
             return True, f"already:unknown:{url}"
-        return False, f"port:{port}"
+        # 0.3.3: optionally free the port automatically instead of just
+        # reporting it. Operator opts in via `nim start --kill` (or via
+        # PROXY_AUTO_KILL for the foreground launcher).
+        if config.get("_auto_kill"):
+            pids = pids_on_port(port)
+            if pids:
+                stopped, failed = kill_pids(pids)
+                if failed:
+                    return False, f"port:{port}"
+                # wait for the socket to actually release
+                for _ in range(20):
+                    if not is_port_in_use(port):
+                        break
+                    time.sleep(0.1)
+                if is_port_in_use(port):
+                    return False, f"port:{port}"
+            else:
+                return False, f"port:{port}"
+        else:
+            return False, f"port:{port}"
 
-    proxy_py = Path(__file__).parent / "proxy.py"
+    proxy_py = Path(__file__).parent / "proxy_impl.py"
     log_file = log_path()
     env = os.environ.copy()
 
@@ -380,6 +399,9 @@ def _env_panel(url: str) -> Panel:
 
 def cmd_start(args: argparse.Namespace) -> None:
     config = load_config()
+    # 0.3.3: `--kill` lets the operator preemptively free a busy port,
+    # so `nim start --kill` always brings the proxy up.
+    config["_auto_kill"] = bool(getattr(args, "kill", False))
     with console.status("[cyan]Starting proxy…[/cyan]", spinner="dots"):
         ok, msg = start_daemon(config)
 
@@ -403,7 +425,9 @@ def cmd_start(args: argparse.Namespace) -> None:
             f"\n[red]✗[/red] Port [bold]{port}[/bold] is already in use by another process."
         )
         console.print(
-            f"  [dim]Fix:[/dim] run [white]nim kill --port {port}[/white] to stop the blocker, or change [cyan]server.port[/cyan] with [white]nim configure server.port <port>[/white]."
+            f"  [dim]Fix:[/dim] run [white]nim start --kill[/white] to auto-free it,"
+            f" or [white]nim kill --port {port}[/white] to stop the blocker manually,"
+            f" or change [cyan]server.port[/cyan] with [white]nim configure server.port <port>[/white]."
         )
         console.print()
         sys.exit(1)
@@ -472,10 +496,11 @@ def cmd_kill(args: argparse.Namespace) -> None:
 
 def cmd_restart(args: argparse.Namespace) -> None:
     console.print()
+    config = load_config()
+    config["_auto_kill"] = bool(getattr(args, "kill", False))
     with console.status("[cyan]Restarting proxy…[/cyan]", spinner="dots"):
         stop_daemon()
         time.sleep(0.5)
-        config = load_config()
         ok, msg = start_daemon(config)
 
     if ok and (msg.startswith("started:") or msg.startswith("already:")):

@@ -9,7 +9,17 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@cloudflare/containers": "latest"
+    "@cloudflare/containers": "latest",
+    "@feniix/pi-sequential-thinking": "^5.0.3",
+    "@pi-unipi/mcp": "^2.1.2",
+    "@pi-unipi/memory": "^2.1.2",
+    "@redentor_dev/pi-orchestrator": "^0.4.0",
+    "@spences10/pi-telemetry": "^0.0.4",
+    "@upstash/context7-pi": "^0.1.1",
+    "@yzlin/pi-subagents": "^0.7.0",
+    "pi-code-tool": "^0.6.1",
+    "pi-multiagent": "^0.9.8",
+    "pi-parallel-sessions": "^0.2.8"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4",

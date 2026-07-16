@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "nim-claude-proxy"
-version = "0.3.1"
+version = "0.3.3"
 description = "Anthropic Messages → NVIDIA NIM Proxy for Claude Code"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -36,7 +36,8 @@ nim-proxy = "proxy:main"
 [tool.hatch.build.targets.wheel]
 packages = ["."]
 include = [
-    "proxy.py",
+    "proxy_impl.py",
+    "proxy/__init__.py",
     "nim_code.py",
     "config.example.yaml",
     ".env.example",
@@ -45,6 +46,8 @@ include = [
 [tool.hatch.build.targets.sdist]
 include = [
     "proxy.py",
+    "proxy_impl.py",
+    "proxy/__init__.py",
     "nim_code.py",
     "config.example.yaml",
     ".env.example",
