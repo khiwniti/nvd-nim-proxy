@@ -399,6 +399,11 @@ def _env_panel(url: str) -> Panel:
 
 def cmd_start(args: argparse.Namespace) -> None:
     config = load_config()
+    config["_auto_kill"] = bool(args.kill)
+    # 0.3.3: read kill flag from command line
+    config["_auto_kill"] = bool(args.kill)
+    config["_auto_kill"] = bool(args.kill)
+    config["_auto_kill"] = bool(args.kill)
     # 0.3.3: `--kill` lets the operator preemptively free a busy port,
     # so `nim start --kill` always brings the proxy up.
     config["_auto_kill"] = bool(getattr(args, "kill", False))
@@ -463,6 +468,11 @@ def cmd_stop(args: argparse.Namespace) -> None:
 def cmd_kill(args: argparse.Namespace) -> None:
     """Kill whichever process is listening on the configured or requested port."""
     config = load_config()
+    config["_auto_kill"] = bool(args.kill)
+    # 0.3.3: read kill flag from command line
+    config["_auto_kill"] = bool(args.kill)
+    config["_auto_kill"] = bool(args.kill)
+    config["_auto_kill"] = bool(args.kill)
     port = int(getattr(args, "port", None) or get_proxy_port(config))
     pids = pids_on_port(port)
     if not pids:
@@ -497,6 +507,11 @@ def cmd_kill(args: argparse.Namespace) -> None:
 def cmd_restart(args: argparse.Namespace) -> None:
     console.print()
     config = load_config()
+    config["_auto_kill"] = bool(args.kill)
+    # 0.3.3: read kill flag from command line
+    config["_auto_kill"] = bool(args.kill)
+    config["_auto_kill"] = bool(args.kill)
+    config["_auto_kill"] = bool(args.kill)
     config["_auto_kill"] = bool(getattr(args, "kill", False))
     with console.status("[cyan]Restarting proxy…[/cyan]", spinner="dots"):
         stop_daemon()
@@ -561,6 +576,11 @@ def _print_log_line(line: str) -> None:
 
 def cmd_status(args: argparse.Namespace) -> None:
     config = load_config()
+    config["_auto_kill"] = bool(args.kill)
+    # 0.3.3: read kill flag from command line
+    config["_auto_kill"] = bool(args.kill)
+    config["_auto_kill"] = bool(args.kill)
+    config["_auto_kill"] = bool(args.kill)
     url = get_proxy_url(config)
     alive, pid = is_running()
 
@@ -675,6 +695,11 @@ def cmd_doctor(args: argparse.Namespace) -> None:
 
     # Daemon
     config = load_config()
+    config["_auto_kill"] = bool(args.kill)
+    # 0.3.3: read kill flag from command line
+    config["_auto_kill"] = bool(args.kill)
+    config["_auto_kill"] = bool(args.kill)
+    config["_auto_kill"] = bool(args.kill)
     alive, pid = is_running()
     url = get_proxy_url(config)
     if alive:
@@ -780,6 +805,11 @@ def cmd_configure(args: argparse.Namespace) -> None:
 
 def cmd_models(args: argparse.Namespace) -> None:
     config = load_config()
+    config["_auto_kill"] = bool(args.kill)
+    # 0.3.3: read kill flag from command line
+    config["_auto_kill"] = bool(args.kill)
+    config["_auto_kill"] = bool(args.kill)
+    config["_auto_kill"] = bool(args.kill)
     url = get_proxy_url(config)
     alive, _ = is_running()
 
@@ -887,6 +917,11 @@ def cmd_use(args: argparse.Namespace) -> None:
 
 def cmd_test(args: argparse.Namespace) -> None:
     config = load_config()
+    config["_auto_kill"] = bool(args.kill)
+    # 0.3.3: read kill flag from command line
+    config["_auto_kill"] = bool(args.kill)
+    config["_auto_kill"] = bool(args.kill)
+    config["_auto_kill"] = bool(args.kill)
     url = get_proxy_url(config)
     model = getattr(args, "model", None) or get_default_model(config)
     prompt = getattr(args, "prompt", None) or "Say 'proxy OK' in exactly 3 words."
@@ -1263,6 +1298,11 @@ def pick_model_interactive(url: str, default_model: str) -> str:
 
 def cmd_code(args: argparse.Namespace) -> None:
     config = load_config()
+    config["_auto_kill"] = bool(args.kill)
+    # 0.3.3: read kill flag from command line
+    config["_auto_kill"] = bool(args.kill)
+    config["_auto_kill"] = bool(args.kill)
+    config["_auto_kill"] = bool(args.kill)
     url = get_proxy_url(config)
 
     # ── Ensure proxy is running BEFORE model picker (so live models are available) ──
@@ -1380,6 +1420,10 @@ def main() -> None:
     sub = parser.add_subparsers(dest="command", metavar="<command>")
 
     sub.add_parser("start", help="Start proxy as background daemon")
+    start_p = sub.parsers["start"]
+    start_p.add_argument("--kill", action="store_true", help="Kill any process on the proxy port before starting")
+    start_p = sub.parsers["start"]
+    start_p.add_argument("--kill", action="store_true", help="Kill any process on the proxy port before starting")
     sub.add_parser("stop", help="Stop running daemon")
     kill_p = sub.add_parser("kill", help="Kill the process listening on the proxy port")
     kill_p.add_argument(
