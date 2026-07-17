@@ -363,7 +363,7 @@ async def _preflight_probes(
     await asyncio.gather(*(_one(t) for t in targets))
 
 
-app = FastAPI(title="nvd-claude-proxy", version="0.3.1", lifespan=lifespan)
+app = FastAPI(title="nvd-claude-proxy", version="0.3.3", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -2015,13 +2015,158 @@ async def stream_response(
 # ─── Entrypoint ──────────────────────────────────────────────────────────────
 
 
+def _port_is_in_use(host: str, port: int) -> bool:
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.5)
+        return s.connect_ex((host, port)) == 0
+
+
+def _pids_on_port(port: int) -> list[int]:
+    """Best-effort list of PIDs listening on a local TCP port."""
+    import shutil
+    import subprocess
+
+    pids: set[int] = set()
+    if shutil.which("lsof"):
+        try:
+            out = subprocess.check_output(
+                ["lsof", "-nP", "-ti", f"TCP:{port}", "-sTCP:LISTEN"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            )
+            for line in out.splitlines():
+                if line.strip().isdigit():
+                    pids.add(int(line.strip()))
+        except subprocess.CalledProcessError:
+            pass
+    if not pids and shutil.which("fuser"):
+        try:
+            out = subprocess.check_output(
+                ["fuser", f"{port}/tcp"], text=True, stderr=subprocess.DEVNULL
+            )
+            for part in out.split():
+                if part.strip().isdigit():
+                    pids.add(int(part.strip()))
+        except subprocess.CalledProcessError:
+            pass
+    return sorted(pids)
+
+
+def _kill_pids(pids: list[int], timeout: float = 3.0) -> tuple[list[int], list[int]]:
+    import os
+    import signal
+    import time
+
+    me = os.getpid()
+    targets = [p for p in pids if p > 0 and p != me]
+    stopped: list[int] = []
+    failed: list[int] = []
+    for pid in targets:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            stopped.append(pid)
+        except OSError:
+            failed.append(pid)
+
+    deadline = time.time() + timeout
+    remaining = [p for p in targets if p not in stopped and p not in failed]
+    while remaining and time.time() < deadline:
+        time.sleep(0.1)
+        nxt: list[int] = []
+        for pid in remaining:
+            try:
+                os.kill(pid, 0)
+                nxt.append(pid)
+            except ProcessLookupError:
+                stopped.append(pid)
+            except OSError:
+                failed.append(pid)
+        remaining = nxt
+    for pid in remaining:
+        try:
+            os.kill(pid, signal.SIGKILL)
+            stopped.append(pid)
+        except ProcessLookupError:
+            stopped.append(pid)
+    return stopped, failed
+
+
+def _preflight_bind_port() -> None:
+    """Free the configured port before uvicorn tries to bind.
+
+    0.3.3: prevents the noisy ``[Errno 98] address already in use`` uvicorn
+    traceback that fires *after* the lifespan banner — which made `nim proxy`
+    / `nim-proxy` look like they hung before crashing.
+    """
+    import os
+
+    host = str(PROXY_HOST)
+    port = int(PROXY_PORT)
+    try:
+        busy = _port_is_in_use(host, port)
+    except OSError:
+        return  # cannot probe (e.g. non-loopback bind); let uvicorn surface it
+    if not busy:
+        return
+
+    auto_kill = os.environ.get("PROXY_AUTO_KILL", "0").strip().lower() in {"1", "true", "yes", "on"}
+    if not auto_kill:
+        # Distinguish "another healthy proxy" from a foreign blocker by
+        # hitting /v1/models once; that decides our message, not the action.
+        pids = _pids_on_port(port)
+        print(
+            f"\n[bind-preflight] port {port} is already in use"
+            + (f" (PID {', '.join(str(p) for p in pids)})" if pids else "")
+            + ".\n"
+            "  Set PROXY_AUTO_KILL=1 to free it automatically, or run:\n"
+            f"  nim kill --port {port}\n"
+            "Aborting before uvicorn raises [Errno 98].\n"
+        )
+        raise SystemExit(1)
+
+    pids = _pids_on_port(port)
+    if not pids:
+        print(f"\n[bind-preflight] port {port} is busy but no PID could be resolved; cannot auto-kill. Aborting.\n")
+        raise SystemExit(1)
+    print(f"\n[bind-preflight] freeing port {port} (killing PIDs"
+          + " " + " ".join(str(p) for p in pids) + ")")
+    stopped, failed = _kill_pids(pids)
+    print(f"[bind-preflight] stopped={stopped} failed={failed}")
+    if failed:
+        print("[bind-preflight] could not stop all holders; aborting.\n")
+        raise SystemExit(1)
+    # Give the kernel a beat to actually release the socket.
+    import time
+
+    for _ in range(20):
+        if not _port_is_in_use(host, port):
+            break
+        time.sleep(0.1)
+    if _port_is_in_use(host, port):
+        print(f"\n[bind-preflight] port {port} still in use after kill; aborting.\n")
+        raise SystemExit(1)
+
+
 def main():
     # 0.3.0: NVIDIA_API_KEY is no longer fatal at startup. Lifespan will still
     # bring the server up; routes return 503 with a hint until the key is set.
     print(
-        "\nnvd-claude-proxy v0.3.1 — NVIDIA_API_KEY is "
+        "\nnvd-claude-proxy v0.3.3 — NVIDIA_API_KEY is "
         + ("set" if NVIDIA_API_KEY else "MISSING (routes will return 503)")
     )
+
+    # 0.3.3: preflight the bind port. If something is already listening
+    # (common after a tmux/shell restart that lost the PID file, or two
+    # `nim proxy` invocations racing), free it automatically when the
+    # operator opts in via PROXY_AUTO_KILL=1. Default is to ask once; set
+    # PROXY_AUTO_KILL=0 to disable entirely. Skipped when another healthy
+    # proxy instance is already serving — that is detected by env
+    # PROXY_SKIP_IF_RUNNING=1 (used by the `nim` CLI so the foreground
+    # launcher never clobbers its own daemon).
+    _preflight_bind_port()
 
     _install_graceful_shutdown_handlers()
 
